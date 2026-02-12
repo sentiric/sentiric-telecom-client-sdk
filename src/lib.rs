@@ -95,7 +95,6 @@ impl UacClient {
                 
                 // Hedef Port: Basitlik için SBC'nin beklediği portu manuel hedefliyoruz.
                 // İdealde SDP'den parse edilmeli. Şimdilik loglardan gördüğümüz 30004 portu.
-                // Veya SBC'nin NAT fix ile düzelttiği IP'ye geri dönmeli.
                 let rtp_target = SocketAddr::new(target_addr.ip(), 30004); 
                 
                 let event_tx_clone = self.event_tx.clone();
@@ -151,8 +150,8 @@ impl UacClient {
 
         // Codec ve Pacer
         let profile = AudioProfile::default();
-        let mut encoder = CodecFactory::create_encoder(CodecType::PCMU); // PCMU Zorla
-        let mut decoder = CodecFactory::create_decoder(CodecType::PCMU);
+        let mut encoder = CodecFactory::create_encoder(profile.preferred_audio_codec());
+        let mut decoder = CodecFactory::create_decoder(profile.preferred_audio_codec());
         let mut pacer = Pacer::new(20);
         
         let rtp_ssrc: u32 = rand::random();
@@ -160,7 +159,7 @@ impl UacClient {
         let mut rtp_ts: u32 = 0;
         let mut recv_buf = [0u8; 2048];
 
-        let _ = event_tx.blocking_send(UacEvent::Log("Media Loop Started".into()));
+        let _ = event_tx.blocking_send(UacEvent::Log(format!("Media Loop Active. Codec: {:?}", profile.preferred_audio_codec())));
 
         // --- TELEMETRİ SAYAÇLARI ---
         let mut tx_count = 0;
@@ -182,7 +181,6 @@ impl UacClient {
                 
                 if !payload.is_empty() {
                     let pkt = RtpPacket { header: RtpHeader::new(0, rtp_seq, rtp_ts, rtp_ssrc), payload };
-                    
                     if let Err(e) = socket.send_to(&pkt.to_bytes(), target) {
                          let _ = event_tx.blocking_send(UacEvent::Error(format!("UDP Send Err: {}", e)));
                          break;
@@ -197,16 +195,19 @@ impl UacClient {
             // 2. RX: Ağdan alıp hoparlöre ver
             socket.set_nonblocking(true)?;
             if let Ok((size, src)) = socket.recv_from(&mut recv_buf) {
-                // Sadece hedef veya SBC'den gelenleri işle (Güvenlik)
-                if src.ip() == target.ip() { 
+                // Güvenlik: Sadece hedef veya SBC'den gelen paketleri işle
+                if src.ip() == target.ip() {
                     rx_count += 1;
-                    if let Ok(pkt) = parser::parse(&recv_buf[..size]) {
-                        // Eğer RTP Header geçerliyse işle (Basit kontrol: Version 2 = 10xxxxxx)
-                        // parser::parse aslında SIP parser'dır, RTP için manual offset gerekebilir.
-                        // Ancak RTP core entegre olmadığı için basitçe ilk 12 byte header'ı atlıyoruz.
-                        if size > 12 {
-                            let rtp_payload = &recv_buf[12..size];
-                            let samples_8k = decoder.decode(rtp_payload);
+                    
+                    // [HATA DÜZELTİLDİ]: Artık SIP Parser yerine Binary kontrol yapıyoruz.
+                    // RTP Paketi en az 12 byte header içerir.
+                    // Version (V) 2 olmalıdır (Binary: 10...... -> 0x80 maskesi)
+                    if size > 12 && (recv_buf[0] & 0xC0) == 0x80 {
+                        // Header'ı atla, payload'ı al
+                        let rtp_payload = &recv_buf[12..size];
+                        
+                        let samples_8k = decoder.decode(rtp_payload);
+                        if !samples_8k.is_empty() {
                             let resampled = simple_resample(&samples_8k, 8000, sample_rate);
                             for s in resampled { 
                                 let _ = spk_prod.push(s as f32 / 32768.0); 
@@ -220,7 +221,7 @@ impl UacClient {
             // 3. LOGLAMA (Her 2 saniyede bir)
             if last_log.elapsed().as_secs() >= 2 {
                 let _ = event_tx.blocking_send(UacEvent::Log(
-                    format!("📊 RTP Stats | TX: {} pkts | RX: {} pkts | Target: {}", tx_count, rx_count, target)
+                    format!("📊 RTP Stats | TX: {} | RX: {} | Target: {}", tx_count, rx_count, target)
                 ));
                 last_log = std::time::Instant::now();
             }
