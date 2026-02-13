@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use sentiric_sip_core::utils::extract_socket_addr; // Adres çözücü helper
 
 pub struct SipEngine {
     event_tx: mpsc::Sender<UacEvent>,
@@ -226,47 +227,58 @@ impl SipEngine {
                              self.change_state(CallState::Ringing);
                          }
 
-                         // 200 OK (Çağrı Kabulü)
-                         if packet.is_response() && packet.status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
-                             
-                             // To Tag'ini sakla (ACK ve BYE için gerekli)
-                             if let Some(to) = packet.get_header_value(HeaderName::To) {
-                                 current_to_tag = to.clone(); 
-                             }
+                        // [KRİTİK GÜNCELLEME: 200 OK İşleme Bloğu]
+                        if packet.is_response() && packet.status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
+                            
+                            // 1. To Tag'i sakla (BYE için gerekli)
+                            if let Some(to) = packet.get_header_value(HeaderName::To) {
+                                current_to_tag = to.clone(); 
+                            }
 
-                             // RTP Hedefini SDP'den Çıkar (Latching)
-                             let sip_ip = src.ip().to_string();
-                             if let Some(rtp_target) = extract_rtp_target(&packet.body, &sip_ip) {
-                                 info!("RTP Latching Target Detected: {}", rtp_target);
-                                 if let Some(rtp) = &self.rtp_engine {
-                                     rtp.start(rtp_target);
-                                 }
-                             } else {
-                                 self.send_ui_error("SDP Parse Error: No RTP target found in 200 OK".into()).await;
-                             }
+                            // 2. ACK HEDEFİNİ BELİRLE (RFC 3261 Uyumlu)
+                            // Önce Contact header'ına bak, yoksa paketin geldiği adrese fallback yap.
+                            let ack_target = if let Some(contact) = packet.get_header_value(HeaderName::Contact) {
+                                if let Some(addr) = extract_socket_addr(contact) {
+                                    info!("🎯 ACK Target from Contact Header: {}", addr);
+                                    addr
+                                } else {
+                                    src // Fallback to packet source
+                                }
+                            } else {
+                                src
+                            };
 
-                             // AUTO-ACK Gönderimi (3-Way Handshake)
-                             let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
-                             let branch = sentiric_sip_core::utils::generate_branch_id();
-                             let bound_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                            // 3. RTP Latching (SDP İşleme)
+                            let sip_ip = src.ip().to_string();
+                            if let Some(rtp_target) = extract_rtp_target(&packet.body, &sip_ip) {
+                                info!("🎙️ RTP Target: {}", rtp_target);
+                                if let Some(rtp) = &self.rtp_engine {
+                                    rtp.start(rtp_target);
+                                }
+                            }
 
-                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP 0.0.0.0:{};branch={}", bound_port, branch)));
-                             ack.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
-                             ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
-                             ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
-                             ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
-                             ack.headers.push(Header::new(HeaderName::MaxForwards, "70".to_string()));
-                             
-                             if let Some(target) = current_target {
-                                 if let Err(e) = socket.send_to(&ack.to_bytes(), target).await {
-                                     warn!("Failed to send ACK: {}", e);
-                                 } else {
-                                     self.send_ui_log("--> AUTO-ACK Sent (Handshake Completed)".into()).await;
-                                 }
-                             }
-                             
-                             self.change_state(CallState::Connected);
-                         }
+                            // 4. ACK Paketini İnşa Et
+                            // ACK URI'si standarda göre Request-URI ile aynı olmalı veya Contact URI olmalı.
+                            let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", ack_target));
+                            let branch = sentiric_sip_core::utils::generate_branch_id();
+                            let bound_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+
+                            ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP 0.0.0.0:{};branch={}", bound_port, branch)));
+                            ack.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
+                            ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
+                            ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
+                            ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
+                            ack.headers.push(Header::new(HeaderName::MaxForwards, "70".to_string()));
+                            
+                            // 5. ACK GÖNDERİMİ
+                            if let Err(e) = socket.send_to(&ack.to_bytes(), ack_target).await {
+                                warn!("❌ Failed to send ACK to {}: {}", ack_target, e);
+                            } else {
+                                self.send_ui_log(format!("--> ACK Sent to {}", ack_target)).await;
+                            }
+                            
+                            self.change_state(CallState::Connected);
+                        }
                          
                          // Karşı taraf BYE gönderirse
                          if packet.is_request() && packet.method == Method::Bye {
