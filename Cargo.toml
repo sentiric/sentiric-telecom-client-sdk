@@ -1,23 +1,36 @@
 [package]
-name = "sentiric-telecom-client-sdk" # YENİ İSİM
-version = "0.1.0"
+name = "sentiric-telecom-client-sdk"
+version = "0.2.0"
 edition = "2021"
-description = "Stateful SIP/RTP Engine for Mobile and Desktop Clients."
-authors = ["Sentiric Team"]
-license = "AGPL-3.0"
+authors = ["Sentiric Team <dev@sentiric.ai>"]
+description = "Professional Stateful SIP/RTP Engine with Real-time Telemetry"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-# --- THE IRON CORE (v1.5.0) ---
+# --- THE IRON CORE ---
 sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", branch = "main" }
 sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git",  branch = "main" }
 
-# --- Async & Logic ---
+# --- Async & Network ---
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 tracing = "0.1"
 rand = "0.8"
 thiserror = "1.0"
+chrono = "0.4"
+
+# --- gRPC Telemetry ---
+tonic = "0.12"
+prost = "0.13"
 
 # --- Audio Hardware ---
 cpal = "0.15"
 ringbuf = "0.3"
+android_logger = "0.13"
+log = "0.4"
+
+[build-dependencies]
+# Derleme sırasında .proto dosyalarını Rust koduna çevirir
+tonic-build = "0.12"
