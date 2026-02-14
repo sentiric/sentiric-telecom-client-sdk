@@ -1,9 +1,9 @@
 [package]
 name = "sentiric-telecom-client-sdk"
-version = "0.2.0"
+version = "0.2.5"
 edition = "2021"
 authors = ["Sentiric Team <dev@sentiric.ai>"]
-description = "Professional Stateful SIP/RTP Engine with Real-time Telemetry"
+description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -32,5 +32,4 @@ android_logger = "0.13"
 log = "0.4"
 
 [build-dependencies]
-# Derleme sırasında .proto dosyalarını Rust koduna çevirir
 tonic-build = "0.12"
