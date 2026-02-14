@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
-
+use serde_json::json; // Cargo.toml'a serde_json eklenmeli
 // Telemetry Module
 pub mod observer_proto {
     tonic::include_proto!("sentiric.observer.v1");
@@ -71,10 +71,24 @@ impl SipEngine {
     }
 
     async fn log_step(&self, msg: String, level: &str, call_id: &str) {
+        // UI'a ham metin gönder (Okunabilirlik için)
         let _ = self.event_tx.send(UacEvent::Log(msg.clone())).await;
+
+        // Observer'a JSON gönder (Analitik için)
+        // Log mesajındaki satır sonlarını kaçış karakteriyle düzeltiyoruz
+        let clean_msg = msg.replace("\n", "\\n").replace("\r", "");
+        
+        let json_payload = json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "level": level,
+            "service": "MOBILE-SDK",
+            "call_id": call_id,
+            "message": clean_msg
+        }).to_string();
+
         let req = IngestLogRequest {
             service_name: "MOBILE-SDK".into(),
-            message: msg,
+            message: json_payload, // JSON string olarak gönder
             level: level.into(),
             trace_id: call_id.into(),
             node_id: "SDK-CLIENT".into(), 
