@@ -10,7 +10,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
-// [FIX]: 'Value' kaldırıldı.
 use serde_json::json; 
 
 // Telemetry Module
@@ -76,12 +75,10 @@ impl SipEngine {
 
     // --- SUTS v4.0 COMPLIANT TELEMETRY ---
     async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: serde_json::Value) {
-        // UI için basit metin
         let _ = self.event_tx.send(UacEvent::Log(format!("[{}] {}", event, message))).await;
 
         let node_name = "mobile-device";
 
-        // SUTS v4 Tam Uyumlu JSON
         let json_payload = json!({
             "schema_v": "1.0.0",
             "ts": chrono::Utc::now().to_rfc3339(),
@@ -100,7 +97,6 @@ impl SipEngine {
             "attributes": attributes
         }).to_string();
 
-        // DÜZELTME: Artık Observer'ın beklediği gibi tek bir 'raw_json_log' alanı gönderiyoruz.
         let req = IngestLogRequest {
             raw_json_log: json_payload,
         };
@@ -204,6 +200,7 @@ impl SipEngine {
                             retransmit_interval.reset();
                             self.change_state(CallState::Dialing);
                         },
+                        
                         ClientCommand::EndCall => {
                              last_invite_packet = None;
                              if self.state != CallState::Idle {
@@ -231,6 +228,14 @@ impl SipEngine {
                                 self.change_state(CallState::Terminated);
                                 self.change_state(CallState::Idle);
                                 media_active_reported = false;
+                            }
+                        },
+
+                        // [YENİ EKLENDİ]: Flutter'dan gelen canlı ayar komutunu yakalar
+                        ClientCommand::UpdateSettings { mic_gain, speaker_gain, enable_aec } => {
+                            if let Some(rtp) = &self.rtp_engine {
+                                tracing::info!("🎛️ Live DSP Update: Mic={:.1}x, Spk={:.1}x, AEC={}", mic_gain, speaker_gain, enable_aec);
+                                rtp.update_gains(mic_gain, speaker_gain);
                             }
                         }
                     }

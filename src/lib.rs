@@ -40,6 +40,13 @@ pub enum ClientCommand {
         from_user: String,
     },
     EndCall,
+    
+    // [YENİ EKLENDİ]: Flutter'dan anlık olarak gelecek ses ayarları
+    UpdateSettings {
+        mic_gain: f32,
+        speaker_gain: f32,
+        enable_aec: bool,
+    },
 }
 
 /// Sentiric Telecom Client'ın ana kapısı.

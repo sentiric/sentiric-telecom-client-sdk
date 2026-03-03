@@ -2,7 +2,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use ringbuf::HeapRb;
 use tracing::{info, error, debug, warn};
 use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
@@ -11,12 +11,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
 use crate::UacEvent; 
 
-// [KRİTİK DÜZELTME]: Gain değerleri ayrıştırıldı.
-// Mikrofon sesi orijinal bırakıldı (Gürültü artışını/boğukluğu engeller).
-const MIC_GAIN: f32 = 1.0;     
-// Hoparlör sesi makul bir seviyede artırıldı.
-const SPEAKER_GAIN: f32 = 1.5; 
-
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
     is_running: Arc<AtomicBool>,
@@ -24,6 +18,10 @@ pub struct RtpEngine {
     pub tx_count: Arc<AtomicU64>,
     headless_mode: bool,
     event_tx: mpsc::Sender<UacEvent>,
+    
+    // [YENİ]: Dinamik ayarlamalar için F32 tipini AtomicU32 ile güvenli şekilde saklarız
+    mic_gain: Arc<AtomicU32>,
+    speaker_gain: Arc<AtomicU32>,
 }
 
 impl RtpEngine {
@@ -35,7 +33,16 @@ impl RtpEngine {
             tx_count: Arc::new(AtomicU64::new(0)),
             headless_mode: headless,
             event_tx,
+            // Varsayılan Değerler:
+            mic_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            speaker_gain: Arc::new(AtomicU32::new(1.5f32.to_bits())),
         }
+    }
+
+    // [YENİ]: Flutter'dan Settings Değiştiğinde Çağrılır
+    pub fn update_gains(&self, mic: f32, spk: f32) {
+        self.mic_gain.store(mic.to_bits(), Ordering::Relaxed);
+        self.speaker_gain.store(spk.to_bits(), Ordering::Relaxed);
     }
 
     pub fn start(&self, target: SocketAddr) {
@@ -49,6 +56,9 @@ impl RtpEngine {
         let tx_cnt = self.tx_count.clone();
         let headless = self.headless_mode;
         let ui_tx = self.event_tx.clone();
+        
+        let live_mic = self.mic_gain.clone();
+        let live_spk = self.speaker_gain.clone();
 
         std::thread::Builder::new()
             .name("rtp-worker".to_string())
@@ -65,7 +75,7 @@ impl RtpEngine {
                     } else {
                         let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Connecting to Hardware Mic/Speaker...".into()));
                         
-                        if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone()) {
+                        if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone(), live_mic, live_spk) {
                             let err_msg = format!("⚠️ Hardware Audio Failed: {}. FALLING BACK TO VIRTUAL AUDIO!", e);
                             let _ = ui_tx_inner.blocking_send(UacEvent::Log(err_msg));
                             
@@ -192,21 +202,24 @@ fn run_headless_loop(
     Ok(())
 }
 
-// --- DONANIM (HARDWARE) LOOP [SELF-HEALING v5 - STUDIO QUALITY] ---
+// --- DONANIM (HARDWARE) LOOP ---
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, 
     socket: Arc<UdpSocket>, 
     target: SocketAddr,
     rx_cnt: Arc<AtomicU64>,
-    tx_cnt: Arc<AtomicU64>
+    tx_cnt: Arc<AtomicU64>,
+    live_mic_gain: Arc<AtomicU32>,
+    live_speaker_gain: Arc<AtomicU32>
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    let rb_in = HeapRb::<f32>::new(48000 * 8); 
+    // [KESİKLİK ÇÖZÜMÜ]: RingBuffer boyutları artırıldı. Mobil dalgalanmalar (Jitter) sesin kesilmesine neden olmaz.
+    let rb_in = HeapRb::<f32>::new(48000 * 16); 
     let (mic_prod, mut mic_cons) = rb_in.split();
     let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
 
-    let rb_out = HeapRb::<f32>::new(48000 * 8);
+    let rb_out = HeapRb::<f32>::new(48000 * 16);
     let (mut spk_prod, spk_cons) = rb_out.split();
     let shared_spk_cons = Arc::new(Mutex::new(spk_cons));
 
@@ -290,24 +303,24 @@ fn run_hardware_loop(
         let output_stream_config: cpal::StreamConfig = output_config.into();
 
         let mic_prod_clone = shared_mic_prod.clone();
+        let l_mic = live_mic_gain.clone();
         
-        // --- MİKROFON YAKALAMA (DÜZELTİLDİ) ---
         let input_stream = match input_device.build_input_stream(
             &input_stream_config, 
             move |data: &[f32], _: &_| {
                 if let Ok(mut producer) = mic_prod_clone.try_lock() {
+                    let current_mic_gain = f32::from_bits(l_mic.load(Ordering::Relaxed));
+                    
                     if in_channels == 1 {
                         for &sample in data { 
-                            let _ = producer.push(sample * MIC_GAIN); 
+                            let _ = producer.push(sample * current_mic_gain); 
                         }
                     } else {
-                        // [KRİTİK DÜZELTME]: Stereo mikrofondan sesi alırken sadece sol kanalı almak yerine
-                        // her iki kanalın ortalamasını alıyoruz (Mix to Mono). Bu sayede ses çok daha tok çıkar.
                         for frame in data.chunks(in_channels) {
                             let mut sum = 0.0;
                             for &s in frame { sum += s; }
                             let avg_sample = sum / in_channels as f32;
-                            let _ = producer.push(avg_sample * MIC_GAIN);
+                            let _ = producer.push(avg_sample * current_mic_gain);
                         }
                     }
                 }
@@ -319,14 +332,15 @@ fn run_hardware_loop(
         };
 
         let spk_cons_clone = shared_spk_cons.clone();
+        let l_spk = live_speaker_gain.clone();
         
-        // --- HOPARLÖR ÇIKTI (DÜZELTİLDİ) ---
         let output_stream = match output_device.build_output_stream(
             &output_stream_config, 
             move |data: &mut [f32], _: &_| {
                 if let Ok(mut consumer) = spk_cons_clone.try_lock() {
+                    let current_spk_gain = f32::from_bits(l_spk.load(Ordering::Relaxed));
                     for frame in data.chunks_mut(out_channels) {
-                        let sample = consumer.pop().unwrap_or(0.0) * SPEAKER_GAIN;
+                        let sample = consumer.pop().unwrap_or(0.0) * current_spk_gain;
                         let safe_sample = sample.clamp(-1.0, 1.0);
                         for s in frame.iter_mut() { *s = safe_sample; }
                     }
