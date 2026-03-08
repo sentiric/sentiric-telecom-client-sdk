@@ -19,7 +19,7 @@ pub struct RtpEngine {
     headless_mode: bool,
     event_tx: mpsc::Sender<UacEvent>,
     
-    // [YENİ]: Dinamik ayarlamalar için F32 tipini AtomicU32 ile güvenli şekilde saklarız
+    // Dinamik ayarlamalar için F32 tipini AtomicU32 ile güvenli şekilde saklarız
     mic_gain: Arc<AtomicU32>,
     speaker_gain: Arc<AtomicU32>,
 }
@@ -33,13 +33,11 @@ impl RtpEngine {
             tx_count: Arc::new(AtomicU64::new(0)),
             headless_mode: headless,
             event_tx,
-            // Varsayılan Değerler:
             mic_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             speaker_gain: Arc::new(AtomicU32::new(1.5f32.to_bits())),
         }
     }
 
-    // [YENİ]: Flutter'dan Settings Değiştiğinde Çağrılır
     pub fn update_gains(&self, mic: f32, spk: f32) {
         self.mic_gain.store(mic.to_bits(), Ordering::Relaxed);
         self.speaker_gain.store(spk.to_bits(), Ordering::Relaxed);
@@ -254,18 +252,23 @@ fn run_hardware_loop(
             }
         };
 
-        let input_config = match input_device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => { 
-                warn!("Default Input config error: {}. Trying fallback configs...", e); 
-                if let Ok(mut supported_configs) = input_device.supported_input_configs() {
-                    if let Some(config) = supported_configs.next() {
-                        config.with_max_sample_rate()
-                    } else {
-                        return Err(anyhow::anyhow!("No supported input config"));
-                    }
+        // [KRİTİK MİMARİ DÜZELTME]: Android AEC ve VoIP Uyumluluğu İçin Kesin "Mono" Arama
+        let input_config = match input_device.supported_input_configs() {
+            Ok(mut configs) => {
+                if let Some(mono_config) = configs.find(|c| c.channels() == 1) {
+                    mono_config.with_max_sample_rate()
                 } else {
-                    return Err(anyhow::anyhow!("Cannot query input configs"));
+                    match input_device.default_input_config() {
+                        Ok(c) => c,
+                        Err(e) => return Err(anyhow::anyhow!("No input config available: {}", e)),
+                    }
+                }
+            },
+            Err(e) => {
+                warn!("Cannot query input configs: {}. Falling back to default.", e);
+                match input_device.default_input_config() {
+                    Ok(c) => c,
+                    Err(err) => return Err(anyhow::anyhow!("Failed to fallback to default input: {}", err)),
                 }
             }
         };
@@ -293,7 +296,7 @@ fn run_hardware_loop(
         
         let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
 
-        info!("🔄 (Re)Starting Audio Stream: In: {}Hz {}ch | Out: {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
+        info!("🔄 Audio Stream Booting: In: {}Hz {}ch | Out: {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
         
         let stream_healthy = Arc::new(AtomicBool::new(true));
         let stream_healthy_in = stream_healthy.clone();
@@ -337,7 +340,7 @@ fn run_hardware_loop(
             err_fn_in, None
         ) {
             Ok(s) => s,
-            Err(e) => { error!("Build Input Failed: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+            Err(e) => { error!("Build Input Failed: {}", e); std::thread::sleep(std::time::Duration::from_millis(500)); continue; }
         };
 
         let spk_cons_clone = shared_spk_cons.clone();
@@ -360,22 +363,24 @@ fn run_hardware_loop(
             err_fn_out, None
         ) {
             Ok(s) => s,
-            Err(e) => { error!("Build Output Failed: {}", e); std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+            Err(e) => { error!("Build Output Failed: {}", e); std::thread::sleep(std::time::Duration::from_millis(500)); continue; }
         };
 
         if let Err(e) = input_stream.play() { error!("Play Input Failed: {}", e); continue; }
         if let Err(e) = output_stream.play() { error!("Play Output Failed: {}", e); continue; }
 
-        // [MİMARİ DÜZELTME]: Loop başlamadan önce biriken çöp ve gecikme backlog'unu temizle (Drain)
-        // Böylece cızırtı ve 6 saniyelik zaman kayması engellenir.
-        while mic_cons.pop().is_some() {}
+        // [MİMARİ DÜZELTME 2]: Hayalet Buffer Tahliyesi (Ghost Buffer Eviction)
+        // Eğer stream hata verip yeniden başladıysa veya çok geç başladıysa birikmiş saniyelerce çöpü erit.
+        let mut flushed_tx = 0;
+        while mic_cons.pop().is_some() { flushed_tx += 1; }
+        info!("🧹 Ghost Buffers Drained: TX (Mic) {} samples. Ready for real-time.", flushed_tx);
 
         while is_running.load(Ordering::SeqCst) && stream_healthy.load(Ordering::SeqCst) {
             pacer.wait();
 
-            // [MİMARİ DÜZELTME]: IF yerine WHILE. 
-            // Thread gecikirse birikmiş olan tüm frame'leri art arda işleyerek gerçek zamana (catch-up) yetişir.
-            while mic_cons.len() >= hw_frame_size {
+            // TX (Mic -> Net)
+            // IF yerine WHILE kullanmıyoruz çünkü artık gecikme backlog'u yok. Ritmik gönderiyoruz.
+            if mic_cons.len() >= hw_frame_size {
                 let mut mic_data = Vec::with_capacity(hw_frame_size);
                 for _ in 0..hw_frame_size {
                     let s = mic_cons.pop().unwrap_or(0.0);
@@ -409,6 +414,7 @@ fn run_hardware_loop(
                             let payload = &recv_buf[12..len];
                             let samples_8k = decoder.decode(payload);
                             let resampled_out = simple_resample(&samples_8k, 8000, hw_sample_rate_out);
+                            // [DÜZELTME]: Doğru obje `spk_prod` (Producer) kullanılıyor.
                             for s in resampled_out { 
                                 let _ = spk_prod.push(s as f32 / 32768.0); 
                             }
