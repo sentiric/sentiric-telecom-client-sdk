@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use ringbuf::HeapRb;
 use tracing::{info, error, warn}; 
-use sentiric_rtp_core::{AudioProfile, CodecFactory, Pacer, RtpHeader, RtpPacket, simple_resample};
+use sentiric_rtp_core::{AudioProfile, CodecFactory, CodecType, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
@@ -67,7 +67,7 @@ impl RtpEngine {
                             let _ = ui_tx_inner.blocking_send(UacEvent::Error(format!("DSP Error: {}", e)));
                         }
                     } else {
-                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Booting Hardware Audio...".into()));
+                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Booting Hardware Audio (PCMU Enforced)...".into()));
                         
                         if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone(), live_mic, live_spk) {
                             let _ = ui_tx_inner.blocking_send(UacEvent::Log(format!("⚠️ Hardware Failed: {}. FALLBACK TO VIRTUAL!", e)));
@@ -90,29 +90,25 @@ impl RtpEngine {
     }
 }
 
-fn run_headless_loop(
-    is_running: Arc<AtomicBool>, socket: Arc<UdpSocket>, target: SocketAddr, rx_cnt: Arc<AtomicU64>, tx_cnt: Arc<AtomicU64>
-) -> anyhow::Result<()> {
-    let profile = AudioProfile::default();
-    let codec_type = profile.preferred_audio_codec();
-    let payload_type = profile.get_by_payload(codec_type as u8).unwrap().payload_type;
+// ... [Headless Loop remains standard for ping/pong tests] ...
+fn run_headless_loop(is_running: Arc<AtomicBool>, socket: Arc<UdpSocket>, target: SocketAddr, rx_cnt: Arc<AtomicU64>, tx_cnt: Arc<AtomicU64>) -> anyhow::Result<()> {
+    let codec_type = CodecType::PCMU;
     let mut encoder = CodecFactory::create_encoder(codec_type);
     let mut decoder = CodecFactory::create_decoder(codec_type);
-    let mut pacer = Pacer::new(profile.ptime as u64);
+    let mut pacer = Pacer::new(20);
     let mut seq: u16 = rand::random();
     let mut ts: u32 = rand::random();
-    let sample_per_frame = codec_type.samples_per_frame(profile.ptime);
     let mut recv_buf = [0u8; 1500];
 
     while is_running.load(Ordering::SeqCst) {
         pacer.wait();
-        let pcm_frame = vec![0i16; sample_per_frame];
+        let pcm_frame = vec![0i16; 160];
         let payload = encoder.encode(&pcm_frame);
         if !payload.is_empty() {
-            let _ = socket.send_to(&RtpPacket { header: RtpHeader::new(payload_type, seq, ts, 0xDEAD), payload }.to_bytes(), target);
+            let _ = socket.send_to(&RtpPacket { header: RtpHeader::new(0, seq, ts, 0xDEAD), payload }.to_bytes(), target);
             tx_cnt.fetch_add(1, Ordering::Relaxed);
             seq = seq.wrapping_add(1);
-            ts = ts.wrapping_add(sample_per_frame as u32);
+            ts = ts.wrapping_add(160);
         }
         while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
             if len > 12 {
@@ -124,6 +120,7 @@ fn run_headless_loop(
     Ok(())
 }
 
+// [Kritik] Baresip Hardware Loop: Donanımla savaşmaz, onu kabul eder ve uydurur.
 fn run_hardware_loop(
     is_running: Arc<AtomicBool>, socket: Arc<UdpSocket>, target: SocketAddr,
     rx_cnt: Arc<AtomicU64>, tx_cnt: Arc<AtomicU64>,
@@ -131,7 +128,7 @@ fn run_hardware_loop(
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
     
-    // Güvenli Bufferlar (E0382 Borrow Checker Hatalarını Çözer)
+    // Güvenli Bufferlar (E0382 Çözümü) - 48k sample (1 saniye opsiyonu)
     let rb_in = HeapRb::<f32>::new(48000); 
     let (mic_prod, mut mic_cons) = rb_in.split();
     let shared_mic_prod = Arc::new(Mutex::new(mic_prod));
@@ -140,25 +137,27 @@ fn run_hardware_loop(
     let (mut spk_prod, spk_cons) = rb_out.split();
     let shared_spk_cons = Arc::new(Mutex::new(spk_cons));
 
-    let profile = AudioProfile::default();
-    let codec_type = profile.preferred_audio_codec();
-    let payload_type = profile.get_by_payload(codec_type as u8).unwrap().payload_type;
+    // Asterisk Lab PCMU Bekler
+    let codec_type = CodecType::PCMU;
+    let payload_type = 0; 
 
     let mut encoder = CodecFactory::create_encoder(codec_type);
     let mut decoder = CodecFactory::create_decoder(codec_type);
-    let mut pacer = Pacer::new(profile.ptime as u64);
+    let mut pacer = Pacer::new(20);
     
     let mut seq: u16 = rand::random();
     let mut ts: u32 = rand::random();
     let ssrc: u32 = rand::random();
-    let target_8k_samples = codec_type.samples_per_frame(profile.ptime);
+    
+    // Telekom standardı 8kHz'de 20ms için 160 sample'dır.
+    let target_8k_samples = 160; 
     let mut recv_buf = [0u8; 1500];
 
     while is_running.load(Ordering::SeqCst) {
         let input_device = host.default_input_device().ok_or(anyhow::anyhow!("No input device"))?;
         let output_device = host.default_output_device().ok_or(anyhow::anyhow!("No output device"))?;
 
-        // BARESIP Mantığı: Donanımla savaşma, Mono/Stereo ne destekliyorsa kabul et (Çökmeleri engeller)
+        // Baresip native hardware acceptance
         let mut input_config: Option<cpal::StreamConfig> = None;
         if let Ok(mut configs) = input_device.supported_input_configs() {
             if let Some(mono_config) = configs.find(|c| c.channels() == 1) {
@@ -185,9 +184,9 @@ fn run_hardware_loop(
         let in_channels = input_stream_config.channels as usize;
         let out_channels = output_config.channels as usize;
         
-        info!("🎙️ Native Audio Config Accepted: IN {}Hz {}ch | OUT {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
+        info!("🎙️ Audio HW Config: IN {}Hz {}ch | OUT {}Hz {}ch", hw_sample_rate_in, in_channels, hw_sample_rate_out, out_channels);
         
-        let hw_frame_size = (hw_sample_rate_in * profile.ptime as usize) / 1000;
+        let hw_frame_size = (hw_sample_rate_in * 20) / 1000;
         let stream_healthy = Arc::new(AtomicBool::new(true));
         
         // --- INPUT STREAM (MIC) ---
@@ -203,7 +202,7 @@ fn run_hardware_loop(
                     if in_channels == 1 {
                         for &s in data { let _ = producer.push(s * gain); }
                     } else {
-                        // Stereo geldiğinde Downmix to Mono (AEC bozulmasını engeller)
+                        // Stereo downmix
                         for frame in data.chunks(in_channels) {
                             let avg = frame.iter().sum::<f32>() / in_channels as f32;
                             let _ = producer.push(avg * gain);
@@ -236,18 +235,20 @@ fn run_hardware_loop(
         input_stream.play()?;
         output_stream.play()?;
 
-        // Anti-Bloat: Döngü başlarken mikrofondaki geçmiş saniyelerden kalan çöpleri sil (0ms Echo için)
+        // [MİMARİ DÜZELTME]: Ghost Buffer Drain.
+        // Cpal arka planda buffer biriktirmiş olabilir, bu eski bufferları 0ms yankı için süpür.
         let mut flushed_tx = 0;
         while mic_cons.pop().is_some() { flushed_tx += 1; }
-        info!("🧹 Ghost Buffers Drained: TX (Mic) {} samples. Ready for real-time.", flushed_tx);
+        info!("🧹 Ghost Buffers Drained: TX {} samples. Real-time ready.", flushed_tx);
         
         pacer.reset(); 
 
         while is_running.load(Ordering::SeqCst) && stream_healthy.load(Ordering::SeqCst) {
             pacer.wait();
 
-            if mic_cons.len() > hw_sample_rate_in {
-                warn!("⚠️ Audio Lag Detected! Purging {} samples to restore real-time sync.", mic_cons.len());
+            // Anti-Lag: Cihaz işlemcisi gecikirse eski sesi at (Catch up)
+            if mic_cons.len() > hw_sample_rate_in / 2 {
+                warn!("⚠️ Lag detected. Purging mic buffer.");
                 while mic_cons.pop().is_some() {}
             }
 
@@ -286,7 +287,7 @@ fn run_hardware_loop(
                 }
             }
         }
-        info!("⚠️ Stream reset triggered.");
+        info!("⚠️ Hardware loop exit.");
     }
     Ok(())
 }
