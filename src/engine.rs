@@ -12,7 +12,6 @@ use tokio::sync::{mpsc, Mutex};
 use std::sync::atomic::Ordering;
 use serde_json::json; 
 
-// Telemetry Module
 pub mod observer_proto {
     tonic::include_proto!("sentiric.observer.v1");
 }
@@ -98,19 +97,17 @@ impl SipEngine {
 
     pub async fn run(&mut self) {
         let local_ip = discover_local_ip();
+        let _ = self.event_tx.try_send(UacEvent::Log(format!("🔍 Discovered Local IP: {}", local_ip)));
         
-        // [KRİTİK MİMARİ DÜZELTME]: NAT Tünelleme ve SIP ALG Tetikleyici
-        // Baresip gibi davranmak ve router'daki SIP ALG'yi uyandırmak için önce 5060'ı deneriz.
         let sip_socket = match TokioUdpSocket::bind("0.0.0.0:5060").await {
             Ok(s) => {
-                let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP Socket bound to Port 5060 (ALG Friendly)".to_string()));
+                let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP bound to Port 5060".to_string()));
                 Arc::new(s)
             },
             Err(_) => {
-                // Eğer 5060 doluysa (başka uygulama kullanıyorsa) rastgele porta geç
                 match TokioUdpSocket::bind("0.0.0.0:0").await {
                     Ok(s) => {
-                        let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP Socket bound to Ephemeral Port".to_string()));
+                        let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP bound to Ephemeral Port".to_string()));
                         Arc::new(s)
                     },
                     Err(e) => {
@@ -174,11 +171,7 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
-                            
-                            // [KRİTİK GÜNCELLEME]: RFC 5626 Outbound (ob) parametresi eklendi.
-                            // Bu, modern sunuculara "Bana ulaşmak istersen IP'me bakma, geldiğim bağlantıyı kullan" der.
                             invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{};transport=udp;ob>", from_user, local_ip, sip_port)));
-                            
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/1.0".to_string()));
 
@@ -190,6 +183,9 @@ impl SipEngine {
                             invite.body = sdp.as_bytes().to_vec();
 
                             let packet_bytes = invite.to_bytes();
+                            
+                            // [GÖZLEM 1]: GİDEN İNVITE PAKETİNİ HAM OLARAK LOGLA
+                            tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&packet_bytes));
                             
                             let _ = self.event_tx.try_send(UacEvent::Log("⬆️ INVITE sent".to_string()));
                             self.send_telemetry("INFO", "SIP_PACKET_SENT", "INVITE sent", &current_call_id, json!({"sip.method": "INVITE"})).await;
@@ -217,6 +213,8 @@ impl SipEngine {
                                     bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
 
                                     let packet_bytes = bye.to_bytes();
+                                    tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&packet_bytes));
+                                    
                                     let _ = self.event_tx.try_send(UacEvent::Log("⬆️ BYE sent".to_string()));
                                     let _ = sip_socket.send_to(&packet_bytes, target).await;
                                 }
@@ -227,7 +225,6 @@ impl SipEngine {
                             }
                         },
 
-                        // [UYARI ÇÖZÜMÜ]: unused_variable uyarısını engellemek için '_' eklendi.
                         ClientCommand::UpdateSettings { mic_gain, speaker_gain, enable_aec: _ } => {
                             if let Some(rtp) = &self.rtp_engine {
                                 rtp.update_gains(mic_gain, speaker_gain);
@@ -240,19 +237,24 @@ impl SipEngine {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
                     let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
+                    
+                    // [GÖZLEM 2]: GELEN HER SIP PAKETİNİ HAM OLARAK LOGLA
+                    tracing::info!("\n============= [RX SIP PACKET] =============\n{}\n===========================================", raw_in);
+                    
                     let first_line = raw_in.lines().next().unwrap_or("UNKNOWN").to_string();
                     let _ = self.event_tx.try_send(UacEvent::Log(format!("⬇️ {}", first_line)));
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
                          
-                         // 1. SUNUCUDAN GELEN ISTEKLERI (REQUESTS) YAKALA
                          if packet.is_request() {
                              if packet.method == Method::Bye {
                                  let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection. Hanging up!".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
                                  
                                  let ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
-                                 let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
+                                 let packet_bytes = ok_resp.to_bytes();
+                                 tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&packet_bytes));
+                                 let _ = sip_socket.send_to(&packet_bytes, src).await;
 
                                  if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                  
@@ -264,8 +266,27 @@ impl SipEngine {
                              continue; 
                          }
 
-                         // 2. SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
                          let status_code = packet.status_code;
+                         
+                         // [GÖZLEM 3]: SERVER BİZİ HANGİ İP'DE GÖRÜYOR?
+                         if status_code == 200 || status_code == 180 || status_code == 100 {
+                             if let Some(via) = packet.get_header_value(HeaderName::Via) {
+                                 let mut pub_ip = None;
+                                 let mut pub_port = None;
+                                 
+                                 for param in via.split(';') {
+                                     if param.starts_with("received=") {
+                                         pub_ip = Some(param[9..].to_string());
+                                     } else if param.starts_with("rport=") {
+                                         pub_port = Some(param[6..].to_string());
+                                     }
+                                 }
+                                 
+                                 if let (Some(ip), Some(port)) = (pub_ip, pub_port) {
+                                     let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 Server View (NAT): {}:{}", ip, port)));
+                                 }
+                             }
+                         }
                          
                          if status_code == 180 || status_code == 183 {
                              self.change_state(CallState::Ringing);
@@ -291,6 +312,7 @@ impl SipEngine {
                              
                              if let Some(target) = current_target {
                                  let ack_bytes = ack.to_bytes();
+                                 tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&ack_bytes));
                                  let _ = self.event_tx.try_send(UacEvent::Log("⬆️ ACK sent".to_string()));
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
