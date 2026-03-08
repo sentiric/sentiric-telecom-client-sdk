@@ -25,8 +25,7 @@ pub struct SipEngine {
     rtp_engine: Option<RtpEngine>,
     state: CallState,
     telemetry_tx: mpsc::Sender<IngestLogRequest>,
-    // [DÜZELTME]: Uyarıyı susturmak için alt çizgi eklendi
-    _observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
+    _observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>, // Warning Fix
     headless: bool,
 }
 
@@ -75,8 +74,6 @@ impl SipEngine {
     }
 
     async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: serde_json::Value) {
-        let _ = self.event_tx.send(UacEvent::Log(format!("[{}] {}", event, message))).await;
-
         let json_payload = json!({
             "schema_v": "1.0.0",
             "ts": chrono::Utc::now().to_rfc3339(),
@@ -176,11 +173,8 @@ impl SipEngine {
 
                             let packet_bytes = invite.to_bytes();
                             
-                            self.send_telemetry("INFO", "SIP_PACKET_SENT", "INVITE sent", &current_call_id, json!({
-                                "sip.method": "INVITE",
-                                "net.dst.ip": target_ip,
-                                "sip.call_id": current_call_id
-                            })).await;
+                            let _ = self.event_tx.try_send(UacEvent::Log("⬆️ INVITE sent".to_string()));
+                            self.send_telemetry("INFO", "SIP_PACKET_SENT", "INVITE sent", &current_call_id, json!({"sip.method": "INVITE"})).await;
 
                             let _ = sip_socket.send_to(&packet_bytes, target_addr).await;
                             last_invite_packet = Some(packet_bytes);
@@ -205,6 +199,7 @@ impl SipEngine {
                                     bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
 
                                     let packet_bytes = bye.to_bytes();
+                                    let _ = self.event_tx.try_send(UacEvent::Log("⬆️ BYE sent".to_string()));
                                     let _ = sip_socket.send_to(&packet_bytes, target).await;
                                 }
                                 if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
@@ -216,7 +211,6 @@ impl SipEngine {
 
                         ClientCommand::UpdateSettings { mic_gain, speaker_gain, enable_aec } => {
                             if let Some(rtp) = &self.rtp_engine {
-                                tracing::info!("🎛️ Live DSP Update: Mic={:.1}x, Spk={:.1}x, AEC={}", mic_gain, speaker_gain, enable_aec);
                                 rtp.update_gains(mic_gain, speaker_gain);
                             }
                         }
@@ -226,20 +220,26 @@ impl SipEngine {
                 Ok((size, src)) = sip_socket.recv_from(&mut buf) => {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
+                    // [KRİTİK GÖRÜNÜRLÜK GÜNCELLEMESİ]: Gelen her paketin ilk satırını zorla ekrana bas.
+                    let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
+                    let first_line = raw_in.lines().next().unwrap_or("UNKNOWN").to_string();
+                    let _ = self.event_tx.try_send(UacEvent::Log(format!("⬇️ {}", first_line)));
+
                     if let Ok(packet) = parser::parse(&buf[..size]) {
                          
                          // -------------------------------------------------------------
-                         // [KRİTİK DÜZELTME]: SUNUCUDAN GELEN ISTEKLERI (REQUESTS) YAKALA
+                         // 1. EĞER SUNUCU BİZE BİR İSTEK (REQUEST) ATARSA (Örn: BYE)
                          // -------------------------------------------------------------
                          if packet.is_request() {
                              if packet.method == Method::Bye {
+                                 let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection. Hanging up!".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
                                  
-                                 // Sunucuya 200 OK Dön (Anladık ve kapattık demek için)
+                                 // Karşı tarafa "Tamam, kapattığını anladım" (200 OK) dönüyoruz.
                                  let ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
                                  let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
 
-                                 // Motoru Durdur
+                                 // Sesi durdur ve çağrıyı bitir
                                  if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                  
                                  self.change_state(CallState::Terminated);
@@ -247,12 +247,11 @@ impl SipEngine {
                                  media_active_reported = false;
                                  last_invite_packet = None;
                              }
-                             // İleride re-INVITE veya OPTIONS gelirse buraya eklenecek
                              continue; 
                          }
 
                          // -------------------------------------------------------------
-                         // SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
+                         // 2. EĞER SUNUCU BİZE BİR CEVAP (RESPONSE) DÖNERSE (Örn: 200 OK)
                          // -------------------------------------------------------------
                          let status_code = packet.status_code;
                          
@@ -280,11 +279,12 @@ impl SipEngine {
                              
                              if let Some(target) = current_target {
                                  let ack_bytes = ack.to_bytes();
+                                 let _ = self.event_tx.try_send(UacEvent::Log("⬆️ ACK sent".to_string()));
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
                              self.change_state(CallState::Connected);
                          } else if status_code >= 400 {
-                             self.send_telemetry("ERROR", "CALL_REJECTED", &format!("Server rejected with {}", status_code), &current_call_id, json!({})).await;
+                             let _ = self.event_tx.try_send(UacEvent::Log(format!("❌ Server rejected with {}", status_code)));
                              self.change_state(CallState::Terminated);
                              self.change_state(CallState::Idle);
                              last_invite_packet = None;
@@ -297,7 +297,7 @@ impl SipEngine {
                         if let Some(target) = current_target {
                             if let Some(start_time) = invite_sent_time {
                                 if start_time.elapsed() > Duration::from_secs(5) {
-                                    self.send_telemetry("ERROR", "CALL_TIMEOUT", "SBC Timeout", &current_call_id, json!({})).await;
+                                    let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Connection Timeout!".to_string()));
                                     last_invite_packet = None;
                                     self.change_state(CallState::Terminated);
                                 } else {
@@ -308,7 +308,6 @@ impl SipEngine {
                     }
                 },
 
-                // [DÜZELTME]: NAT Keepalive döngüsü tokio::select! içine eklendi (Mutable Warning Çözümü)
                 _ = nat_keepalive_interval.tick() => {
                     if self.state != CallState::Idle {
                         if let Some(target) = current_target {
