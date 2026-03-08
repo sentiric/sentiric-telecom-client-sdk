@@ -28,6 +28,23 @@ pub struct SipEngine {
     headless: bool,
 }
 
+// [YENİ]: Via başlığından public IP ve portu çıkaran helper fonksiyon
+fn extract_public_addr_from_via(via: &str, fallback_ip: &str, fallback_port: u16) -> (String, u16) {
+    let mut ip = fallback_ip.to_string();
+    let mut port = fallback_port;
+    for param in via.split(';') {
+        let p_trim = param.trim();
+        if p_trim.starts_with("received=") {
+            ip = p_trim[9..].to_string();
+        } else if p_trim.starts_with("rport=") {
+            if let Ok(p) = p_trim[6..].parse::<u16>() {
+                port = p;
+            }
+        }
+    }
+    (ip, port)
+}
+
 impl SipEngine {
     pub async fn new(
         event_tx: mpsc::Sender<UacEvent>,
@@ -99,6 +116,7 @@ impl SipEngine {
         let local_ip = discover_local_ip();
         let _ = self.event_tx.try_send(UacEvent::Log(format!("🔍 Discovered Local IP: {}", local_ip)));
         
+        // Önce 5060 (SIP ALG) deniyoruz, olmazsa rastgele port
         let sip_socket = match TokioUdpSocket::bind("0.0.0.0:5060").await {
             Ok(s) => {
                 let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP bound to Port 5060".to_string()));
@@ -120,7 +138,7 @@ impl SipEngine {
 
         let rtp_socket_std = match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => {
-                s.set_nonblocking(true).expect("Failed to set non-blocking on RTP socket");
+                s.set_nonblocking(true).unwrap();
                 Arc::new(s)
             },
             Err(e) => {
@@ -139,6 +157,10 @@ impl SipEngine {
         let mut current_from_tag = String::new();
         let mut current_to_tag = String::new();
         let mut current_cseq = 0;
+        
+        // NAT Keşfi İçin Dinamik Değişkenler
+        let mut discovered_public_ip = local_ip.clone();
+        let mut discovered_public_port = sip_port;
 
         let mut last_invite_packet: Option<Vec<u8>> = None;
         let mut retransmit_interval = tokio::time::interval(Duration::from_millis(500));
@@ -171,7 +193,7 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
-                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{};transport=udp;ob>", from_user, local_ip, sip_port)));
+                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, sip_port)));
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/1.0".to_string()));
 
@@ -183,10 +205,6 @@ impl SipEngine {
                             invite.body = sdp.as_bytes().to_vec();
 
                             let packet_bytes = invite.to_bytes();
-                            
-                            // [GÖZLEM 1]: GİDEN İNVITE PAKETİNİ HAM OLARAK LOGLA
-                            tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&packet_bytes));
-                            
                             let _ = self.event_tx.try_send(UacEvent::Log("⬆️ INVITE sent".to_string()));
                             self.send_telemetry("INFO", "SIP_PACKET_SENT", "INVITE sent", &current_call_id, json!({"sip.method": "INVITE"})).await;
 
@@ -204,17 +222,17 @@ impl SipEngine {
                                     let mut bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
                                     let branch = sentiric_sip_core::utils::generate_branch_id();
                                     
-                                    bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, sip_port, branch)));
+                                    // [NAT GÜNCELLEMESİ]: Öğrenilen Public IP'yi kullanıyoruz
+                                    bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", discovered_public_ip, discovered_public_port, branch)));
                                     bye.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                                     bye.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                                     bye.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                                     
                                     current_cseq += 1;
                                     bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
+                                    bye.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", discovered_public_ip, discovered_public_port)));
 
                                     let packet_bytes = bye.to_bytes();
-                                    tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&packet_bytes));
-                                    
                                     let _ = self.event_tx.try_send(UacEvent::Log("⬆️ BYE sent".to_string()));
                                     let _ = sip_socket.send_to(&packet_bytes, target).await;
                                 }
@@ -237,24 +255,19 @@ impl SipEngine {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
                     let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
-                    
-                    // [GÖZLEM 2]: GELEN HER SIP PAKETİNİ HAM OLARAK LOGLA
-                    tracing::info!("\n============= [RX SIP PACKET] =============\n{}\n===========================================", raw_in);
-                    
                     let first_line = raw_in.lines().next().unwrap_or("UNKNOWN").to_string();
                     let _ = self.event_tx.try_send(UacEvent::Log(format!("⬇️ {}", first_line)));
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
                          
+                         // 1. SUNUCUDAN GELEN ISTEKLERI (REQUESTS) YAKALA
                          if packet.is_request() {
                              if packet.method == Method::Bye {
                                  let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection. Hanging up!".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
                                  
                                  let ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
-                                 let packet_bytes = ok_resp.to_bytes();
-                                 tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&packet_bytes));
-                                 let _ = sip_socket.send_to(&packet_bytes, src).await;
+                                 let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
 
                                  if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                  
@@ -266,33 +279,25 @@ impl SipEngine {
                              continue; 
                          }
 
+                         // 2. SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
                          let status_code = packet.status_code;
                          
-                         // [GÖZLEM 3]: SERVER BİZİ HANGİ İP'DE GÖRÜYOR?
-                         if status_code == 200 || status_code == 180 || status_code == 100 {
+                         // [NAT KEŞFİ]: Sunucu bize yanıt verdiğinde Public IP'mizi öğren!
+                         if status_code >= 100 && self.state == CallState::Dialing {
+                             last_invite_packet = None;
                              if let Some(via) = packet.get_header_value(HeaderName::Via) {
-                                 let mut pub_ip = None;
-                                 let mut pub_port = None;
-                                 
-                                 for param in via.split(';') {
-                                     if param.starts_with("received=") {
-                                         pub_ip = Some(param[9..].to_string());
-                                     } else if param.starts_with("rport=") {
-                                         pub_port = Some(param[6..].to_string());
-                                     }
-                                 }
-                                 
-                                 if let (Some(ip), Some(port)) = (pub_ip, pub_port) {
-                                     let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 Server View (NAT): {}:{}", ip, port)));
+                                 let (ip, port) = extract_public_addr_from_via(via, &local_ip, sip_port);
+                                 if ip != local_ip {
+                                     let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 NAT Discovery: Public IP is {}:{}", ip, port)));
+                                     discovered_public_ip = ip;
+                                     discovered_public_port = port;
                                  }
                              }
                          }
                          
                          if status_code == 180 || status_code == 183 {
                              self.change_state(CallState::Ringing);
-                         } else if status_code >= 100 && status_code < 200 {
-                             last_invite_packet = None; 
-                         }
+                         } 
                          
                          if status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
                              if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
@@ -304,15 +309,19 @@ impl SipEngine {
                              
                              let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                              let branch = sentiric_sip_core::utils::generate_branch_id();
-                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", local_ip, sip_port, branch)));
-                             ack.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
+
+                             // [NAT GÜNCELLEMESİ]: ACK paketinde artık Public IP kullanıyoruz.
+                             ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", discovered_public_ip, discovered_public_port, branch)));
+                             if let Some(from) = packet.get_header_value(HeaderName::From) { 
+                                 ack.headers.push(Header::new(HeaderName::From, from.clone())); 
+                             }
                              ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                              ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
+                             ack.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", discovered_public_ip, discovered_public_port)));
                              
                              if let Some(target) = current_target {
                                  let ack_bytes = ack.to_bytes();
-                                 tracing::info!("\n============= [TX SIP PACKET] =============\n{}\n===========================================", String::from_utf8_lossy(&ack_bytes));
                                  let _ = self.event_tx.try_send(UacEvent::Log("⬆️ ACK sent".to_string()));
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
