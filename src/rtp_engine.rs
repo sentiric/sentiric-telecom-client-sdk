@@ -1,15 +1,16 @@
 // sentiric-telecom-client-sdk/src/rtp_engine.rs
-
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use ringbuf::HeapRb;
 use tracing::{info, error, warn}; 
-use sentiric_rtp_core::{AudioProfile, CodecFactory, CodecType, Pacer, RtpHeader, RtpPacket, simple_resample};
+// [DÜZELTME]: AudioProfile kaldırıldı.
+use sentiric_rtp_core::{CodecFactory, CodecType, Pacer, RtpHeader, RtpPacket, simple_resample};
 use std::panic;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc;
-use crate::UacEvent; 
+use crate::UacEvent;
+
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,

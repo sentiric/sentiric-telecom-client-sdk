@@ -25,7 +25,8 @@ pub struct SipEngine {
     rtp_engine: Option<RtpEngine>,
     state: CallState,
     telemetry_tx: mpsc::Sender<IngestLogRequest>,
-    observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
+    // [DÜZELTME]: Uyarıyı susturmak için alt çizgi eklendi
+    _observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
     headless: bool,
 }
 
@@ -46,7 +47,7 @@ impl SipEngine {
             rtp_engine: None,
             state: CallState::Idle,
             telemetry_tx: tel_tx,
-            observer_client,
+            _observer_client: observer_client,
             headless,
         }
     }
@@ -166,8 +167,6 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/1.0".to_string()));
 
-                            // [KRİTİK MİMARİ DÜZELTME]: SDP Codec Enforcement (PCMU)
-                            // Mobil tarafta Asterisk lab testlerinin geçmesi için Payload=0 (PCMU) kilitlendi.
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
                                 "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
@@ -228,19 +227,42 @@ impl SipEngine {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
-                         // Gelen Paket Loglama
+                         
+                         // -------------------------------------------------------------
+                         // [KRİTİK DÜZELTME]: SUNUCUDAN GELEN ISTEKLERI (REQUESTS) YAKALA
+                         // -------------------------------------------------------------
+                         if packet.is_request() {
+                             if packet.method == Method::Bye {
+                                 self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
+                                 
+                                 // Sunucuya 200 OK Dön (Anladık ve kapattık demek için)
+                                 let ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
+                                 let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
+
+                                 // Motoru Durdur
+                                 if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
+                                 
+                                 self.change_state(CallState::Terminated);
+                                 self.change_state(CallState::Idle);
+                                 media_active_reported = false;
+                                 last_invite_packet = None;
+                             }
+                             // İleride re-INVITE veya OPTIONS gelirse buraya eklenecek
+                             continue; 
+                         }
+
+                         // -------------------------------------------------------------
+                         // SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
+                         // -------------------------------------------------------------
                          let status_code = packet.status_code;
                          
-                         // UI'a durum güncellemelerini yansıt
-                         if packet.is_response() {
-                             if status_code == 180 || status_code == 183 {
-                                 self.change_state(CallState::Ringing);
-                             } else if status_code >= 100 && status_code < 200 {
-                                 last_invite_packet = None; // Trying aldıysak retransmit'i kes
-                             }
+                         if status_code == 180 || status_code == 183 {
+                             self.change_state(CallState::Ringing);
+                         } else if status_code >= 100 && status_code < 200 {
+                             last_invite_packet = None; 
                          }
                          
-                         if packet.is_response() && status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
+                         if status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
                              if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
                              
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
@@ -261,7 +283,7 @@ impl SipEngine {
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
                              self.change_state(CallState::Connected);
-                         } else if packet.is_response() && status_code >= 400 {
+                         } else if status_code >= 400 {
                              self.send_telemetry("ERROR", "CALL_REJECTED", &format!("Server rejected with {}", status_code), &current_call_id, json!({})).await;
                              self.change_state(CallState::Terminated);
                              self.change_state(CallState::Idle);
@@ -282,6 +304,16 @@ impl SipEngine {
                                     let _ = sip_socket.send_to(packet, target).await;
                                 }
                             }
+                        }
+                    }
+                },
+
+                // [DÜZELTME]: NAT Keepalive döngüsü tokio::select! içine eklendi (Mutable Warning Çözümü)
+                _ = nat_keepalive_interval.tick() => {
+                    if self.state != CallState::Idle {
+                        if let Some(target) = current_target {
+                            let keepalive = b"\r\n\r\n";
+                            let _ = sip_socket.send_to(keepalive, target).await;
                         }
                     }
                 },
