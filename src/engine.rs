@@ -25,7 +25,7 @@ pub struct SipEngine {
     rtp_engine: Option<RtpEngine>,
     state: CallState,
     telemetry_tx: mpsc::Sender<IngestLogRequest>,
-    _observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>, // Warning Fix
+    _observer_client: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
     headless: bool,
 }
 
@@ -99,11 +99,25 @@ impl SipEngine {
     pub async fn run(&mut self) {
         let local_ip = discover_local_ip();
         
-        let sip_socket = match TokioUdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                let _ = self.event_tx.send(UacEvent::Error(format!("SIP Bind Fail: {}", e))).await;
-                return;
+        // [KRİTİK MİMARİ DÜZELTME]: NAT Tünelleme ve SIP ALG Tetikleyici
+        // Baresip gibi davranmak ve router'daki SIP ALG'yi uyandırmak için önce 5060'ı deneriz.
+        let sip_socket = match TokioUdpSocket::bind("0.0.0.0:5060").await {
+            Ok(s) => {
+                let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP Socket bound to Port 5060 (ALG Friendly)".to_string()));
+                Arc::new(s)
+            },
+            Err(_) => {
+                // Eğer 5060 doluysa (başka uygulama kullanıyorsa) rastgele porta geç
+                match TokioUdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => {
+                        let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP Socket bound to Ephemeral Port".to_string()));
+                        Arc::new(s)
+                    },
+                    Err(e) => {
+                        let _ = self.event_tx.send(UacEvent::Error(format!("SIP Bind Fail: {}", e))).await;
+                        return;
+                    }
+                }
             }
         };
 
@@ -160,7 +174,11 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
-                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, local_ip, sip_port)));
+                            
+                            // [KRİTİK GÜNCELLEME]: RFC 5626 Outbound (ob) parametresi eklendi.
+                            // Bu, modern sunuculara "Bana ulaşmak istersen IP'me bakma, geldiğim bağlantıyı kullan" der.
+                            invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{};transport=udp;ob>", from_user, local_ip, sip_port)));
+                            
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/1.0".to_string()));
 
@@ -209,7 +227,8 @@ impl SipEngine {
                             }
                         },
 
-                        ClientCommand::UpdateSettings { mic_gain, speaker_gain, enable_aec } => {
+                        // [UYARI ÇÖZÜMÜ]: unused_variable uyarısını engellemek için '_' eklendi.
+                        ClientCommand::UpdateSettings { mic_gain, speaker_gain, enable_aec: _ } => {
                             if let Some(rtp) = &self.rtp_engine {
                                 rtp.update_gains(mic_gain, speaker_gain);
                             }
@@ -220,26 +239,21 @@ impl SipEngine {
                 Ok((size, src)) = sip_socket.recv_from(&mut buf) => {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
-                    // [KRİTİK GÖRÜNÜRLÜK GÜNCELLEMESİ]: Gelen her paketin ilk satırını zorla ekrana bas.
                     let raw_in = String::from_utf8_lossy(&buf[..size]).to_string();
                     let first_line = raw_in.lines().next().unwrap_or("UNKNOWN").to_string();
                     let _ = self.event_tx.try_send(UacEvent::Log(format!("⬇️ {}", first_line)));
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
                          
-                         // -------------------------------------------------------------
-                         // 1. EĞER SUNUCU BİZE BİR İSTEK (REQUEST) ATARSA (Örn: BYE)
-                         // -------------------------------------------------------------
+                         // 1. SUNUCUDAN GELEN ISTEKLERI (REQUESTS) YAKALA
                          if packet.is_request() {
                              if packet.method == Method::Bye {
                                  let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection. Hanging up!".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
                                  
-                                 // Karşı tarafa "Tamam, kapattığını anladım" (200 OK) dönüyoruz.
                                  let ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
                                  let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
 
-                                 // Sesi durdur ve çağrıyı bitir
                                  if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                  
                                  self.change_state(CallState::Terminated);
@@ -250,9 +264,7 @@ impl SipEngine {
                              continue; 
                          }
 
-                         // -------------------------------------------------------------
-                         // 2. EĞER SUNUCU BİZE BİR CEVAP (RESPONSE) DÖNERSE (Örn: 200 OK)
-                         // -------------------------------------------------------------
+                         // 2. SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
                          let status_code = packet.status_code;
                          
                          if status_code == 180 || status_code == 183 {
