@@ -3,6 +3,7 @@
 pub mod engine;
 pub mod rtp_engine;
 pub mod utils;
+pub mod stun;
 
 use tokio::sync::mpsc;
 
