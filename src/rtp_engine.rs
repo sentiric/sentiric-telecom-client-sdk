@@ -84,7 +84,7 @@ impl RtpEngine {
                     if headless {
                         let _ = ui_tx_inner.blocking_send(UacEvent::Log("👻 Booting Virtual DSP".into()));
                     } else {
-                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Booting Hardware Audio (Anti-Crackle Active)...".into()));
+                        let _ = ui_tx_inner.blocking_send(UacEvent::Log("🎤 Booting Hardware Audio (Strict QoS Active)...".into()));
                         if let Err(e) = run_hardware_loop(is_running_inner.clone(), socket.clone(), target, rx_cnt.clone(), tx_cnt.clone(), live_mic, live_spk, dtmf_queue) {
                             let _ = ui_tx_inner.blocking_send(UacEvent::Log(format!("⚠️ Hardware Failed: {}", e)));
                         }
@@ -186,14 +186,12 @@ fn run_hardware_loop(
         }, err_fn_in, None
     )?;
 
-    // --- OUTPUT STREAM (SPEAKER - ANTI-CRACKLE) ---
+    // --- OUTPUT STREAM (SPEAKER - STRICT QUALITY) ---
+    // [ANTI-LAZY]: Distorsiyon yaratan soft-clipping ve decay kaldırıldı. Doğrudan donanım sınırlarına clamp ediliyor.
     let err_fn_out = { let s = stream_healthy.clone(); move |e| { error!("Spk Error: {}", e); s.store(false, Ordering::SeqCst); } };
     let l_spk = live_speaker_gain.clone();
     let spk_cons_clone = shared_spk_cons.clone(); 
     
-    // [ANTI-CRACKLE]: State for Jitter Fade
-    let mut last_spk_sample: f32 = 0.0;
-
     let output_stream = output_device.build_output_stream(
         &output_config,
         move |data: &mut [f32], _: &_| {
@@ -201,19 +199,13 @@ fn run_hardware_loop(
                 let gain = f32::from_bits(l_spk.load(Ordering::Relaxed));
                 for frame in data.chunks_mut(out_channels) {
                     
-                    // Buffer boşsa aniden 0'a düşme, yumuşakça sönümle (Decay).
-                    let mut sample = consumer.pop().unwrap_or_else(|| {
-                        last_spk_sample *= 0.85; 
-                        last_spk_sample
-                    });
+                    // Buffer boşsa saf sessizlik (0.0) bas. 
+                    let sample = consumer.pop().unwrap_or(0.0);
                     
-                    sample *= gain;
+                    // Doğrudan Gain ve Hard-Clamp. Soft-clipping sinyali kirletir.
+                    let final_sample = (sample * gain).clamp(-1.0, 1.0);
                     
-                    // Soft-Clipping
-                    sample = sample / (1.0 + sample.abs() * 0.3); 
-                    last_spk_sample = sample;
-                    
-                    for s in frame.iter_mut() { *s = sample.clamp(-1.0, 1.0); }
+                    for s in frame.iter_mut() { *s = final_sample; }
                 }
             } else {
                  for s in data.iter_mut() { *s = 0.0; }
@@ -237,7 +229,6 @@ fn run_hardware_loop(
         // [DTMF INJECTION]
         let dtmf_event = dtmf_queue.swap(255, Ordering::Relaxed);
         if dtmf_event != 255 {
-            // [KRİTİK DÜZELTME]: Türü u16 olarak belirttik
             let mut dtmf_duration: u16 = 160;
             
             for i in 0..5 {
@@ -245,7 +236,6 @@ fn run_hardware_loop(
                 let volume = 10; 
                 let mut payload = vec![dtmf_event, end_bit | volume];
                 
-                // to_be_bytes() artık u16 üzerinden çalışıp 2 byte döndürecek
                 payload.extend_from_slice(&dtmf_duration.to_be_bytes());
                 
                 let packet = RtpPacket { header: RtpHeader::new(dtmf_payload_type, seq, ts, ssrc), payload };
