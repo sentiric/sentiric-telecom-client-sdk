@@ -192,9 +192,16 @@ impl SipEngine {
                             if self.state != CallState::Idle { continue; }
                             
                             let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port).parse().unwrap();
+                         
                             current_target = Some(target_addr);
+                            
                             current_call_id = format!("uac-{:x}", rand::random::<u32>());
+                            
+                            // [YENİ EKLENDİ]: UI'ın takip edebilmesi için Call-ID'yi fırlat
+                            let _ = self.event_tx.try_send(UacEvent::CallIdGenerated(current_call_id.clone()));
+                            
                             current_from_tag = format!("tag-{:x}", rand::random::<u16>());
+
                             current_cseq = 1;
 
                             // --- BARESIP-LIKE AKILLI NAT (INTELLIGENT ROUTING) ---

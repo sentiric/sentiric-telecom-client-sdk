@@ -15,6 +15,7 @@ pub enum UacEvent {
     MediaActive,
     RtpStats { rx_cnt: u64, tx_cnt: u64 },
     Error(String),
+    CallIdGenerated(String), // <--- YENİ EKLENDİ
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
