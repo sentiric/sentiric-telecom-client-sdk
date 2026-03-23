@@ -1,4 +1,4 @@
-// sentiric-telecom-client-sdk/src/rtp_engine.rs
+// Dosya: sentiric-telecom-client-sdk/src/rtp_engine.rs
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -6,14 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use std::panic;
 
-
 use sentiric_rtp_core::{CodecFactory, CodecType, Pacer, RtpHeader, RtpPacket};
 use crate::UacEvent;
 use crate::media::{MediaAdapter, HardwareAdapter, HeadlessAdapter};
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
-    is_running: Arc<AtomicBool>,
+    pub is_running: Arc<AtomicBool>, // [MİMARİ DÜZELTME]: E0616 Hatası için 'pub' eklendi
     pub rx_count: Arc<AtomicU64>,
     pub tx_count: Arc<AtomicU64>,
     headless_mode: bool,
@@ -21,7 +20,7 @@ pub struct RtpEngine {
     mic_gain: Arc<AtomicU32>,
     speaker_gain: Arc<AtomicU32>,
     dtmf_queue: Arc<AtomicU8>, 
-    is_muted: Arc<AtomicBool>, // MUTE KONTROLCÜSÜ
+    is_muted: Arc<AtomicBool>,
 }
 
 impl RtpEngine {
@@ -100,6 +99,12 @@ impl RtpEngine {
 
     pub fn stop(&self) {
         self.is_running.store(false, Ordering::SeqCst);
+    }
+
+    ///[YENİ]: Çağrı sonlandığında sayaçları sıfırlar. 
+    pub fn reset_stats(&self) {
+        self.rx_count.store(0, Ordering::Relaxed);
+        self.tx_count.store(0, Ordering::Relaxed);
     }
 }
 

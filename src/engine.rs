@@ -1,4 +1,5 @@
 // Dosya: sentiric-telecom-client-sdk/src/engine.rs
+
 use crate::{CallState, ClientCommand, UacEvent};
 use crate::rtp_engine::RtpEngine;
 use crate::utils::{extract_rtp_target, discover_local_ip};
@@ -6,6 +7,7 @@ use crate::stun::StunClient;
 use sentiric_sip_core::{parser, Header, HeaderName, Method, SipPacket};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering; //[MİMARİ DÜZELTME]: E0433 Hatası için eklendi
 use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, Mutex};
@@ -348,7 +350,11 @@ impl SipEngine {
                                     let _ = self.event_tx.try_send(UacEvent::Log("⬆️ BYE sent".to_string()));
                                     let _ = sip_socket.send_to(&packet_bytes, target).await;
                                 }
-                                if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
+
+                                if let Some(rtp) = &self.rtp_engine { 
+                                    rtp.stop(); 
+                                    rtp.reset_stats(); // [MİMARİ DÜZELTME]: Sayaçları temizle
+                                }
                                 
                                 self.change_state(CallState::Terminated);
                                 if reg_user.is_empty() {
@@ -382,7 +388,6 @@ impl SipEngine {
                     }
                 },
 
-                // 2. AĞDAN PAKET ALMA
                 Ok((size, src)) = sip_socket.recv_from(&mut buf) => {
                     if size < 4 || (buf[0] & 0x80) != 0 { continue; }
 
@@ -441,7 +446,10 @@ impl SipEngine {
                                  let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
                                  let _ = self.event_tx.try_send(UacEvent::Log("⬆️ 200 OK (For BYE) sent".to_string()));
 
-                                 if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
+                                 if let Some(rtp) = &self.rtp_engine { 
+                                     rtp.stop(); 
+                                     rtp.reset_stats(); // [MİMARİ DÜZELTME]: Sayaçları temizle
+                                 }
                                  
                                  self.change_state(CallState::Terminated);
                                  if reg_user.is_empty() {
@@ -591,14 +599,20 @@ impl SipEngine {
                 },
 
                 _ = stats_ticker.tick() => {
-                    if let Some(rtp) = &self.rtp_engine {
-                        let rx = std::sync::atomic::AtomicU64::load(&rtp.rx_count, std::sync::atomic::Ordering::Relaxed);
-                        let tx = std::sync::atomic::AtomicU64::load(&rtp.tx_count, std::sync::atomic::Ordering::Relaxed);
-                        if rx > 0 || tx > 0 {
-                            let _ = self.event_tx.try_send(UacEvent::RtpStats { rx_cnt: rx, tx_cnt: tx });
-                            if !media_active_reported && rx > 10 {
-                                media_active_reported = true;
-                                let _ = self.event_tx.try_send(UacEvent::MediaActive);
+                    //[MİMARİ DÜZELTME]: Yalnızca aktif çağrı sırasında istatistikleri UI'a gönder
+                    if self.state == CallState::Connected {
+                        if let Some(rtp) = &self.rtp_engine {
+                            let is_running = rtp.is_running.load(Ordering::SeqCst);
+                            if is_running {
+                                let rx = std::sync::atomic::AtomicU64::load(&rtp.rx_count, std::sync::atomic::Ordering::Relaxed);
+                                let tx = std::sync::atomic::AtomicU64::load(&rtp.tx_count, std::sync::atomic::Ordering::Relaxed);
+                                if rx > 0 || tx > 0 {
+                                    let _ = self.event_tx.try_send(UacEvent::RtpStats { rx_cnt: rx, tx_cnt: tx });
+                                    if !media_active_reported && rx > 10 {
+                                        media_active_reported = true;
+                                        let _ = self.event_tx.try_send(UacEvent::MediaActive);
+                                    }
+                                }
                             }
                         }
                     }
