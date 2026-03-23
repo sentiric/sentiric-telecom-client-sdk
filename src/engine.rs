@@ -1,5 +1,4 @@
 // Dosya: sentiric-telecom-client-sdk/src/engine.rs
-
 use crate::{CallState, ClientCommand, UacEvent};
 use crate::rtp_engine::RtpEngine;
 use crate::utils::{extract_rtp_target, discover_local_ip};
@@ -180,7 +179,6 @@ impl SipEngine {
 
         let mut last_invite_packet: Option<Vec<u8>> = None;
         
-        // [YENİ]: Gelen Arama Hafızası
         let mut incoming_invite_packet: Option<SipPacket> = None;
         let mut remote_addr: Option<SocketAddr> = None;
 
@@ -201,7 +199,6 @@ impl SipEngine {
                             if let (Some(invite), Some(target)) = (incoming_invite_packet.take(), remote_addr) {
                                 let _ = self.event_tx.try_send(UacEvent::Log("⬆️ Sending 200 OK (Accepting Call)".to_string()));
                                 
-                                // RTP Latching: Gelen SDP'den hedefi çöz
                                 if let Some(rtp_target) = extract_rtp_target(&invite.body, &target.ip().to_string()) {
                                     self.send_telemetry("INFO", "SDP_PARSED", "Media target locked", &current_call_id, json!({"target": rtp_target.to_string()})).await;
                                     if let Some(rtp) = &self.rtp_engine { rtp.start(rtp_target); }
@@ -209,7 +206,6 @@ impl SipEngine {
 
                                 let mut ok_resp = sentiric_sip_core::builder::SipResponseFactory::create_200_ok(&invite);
                                 
-                                // Tag Ekle (To)
                                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                                     if !to_h.value.contains(";tag=") {
                                         current_to_tag = format!("tag-{:x}", rand::random::<u16>());
@@ -398,9 +394,7 @@ impl SipEngine {
                          
                          if packet.is_request() {
 
-                             // [YENİ]: Gelen Arama (INVITE) Yönetimi
                              if packet.method == Method::Invite {
-                                 // Eğer o an bir çağrıdaysak meşgul çal (486 Busy Here)
                                  if self.state != CallState::Idle && self.state != CallState::Registered {
                                      let mut busy = sentiric_sip_core::builder::SipResponseFactory::create_error(&packet, 486, "Busy Here");
                                      busy.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
@@ -413,15 +407,12 @@ impl SipEngine {
                                  
                                  tracing::info!(event="INBOUND_INVITE_RECEIVED", sip.call_id=%call_id, "🔔 Gelen arama tespit edildi: {}", from_val);
                                  
-                                 // Hafızaya Al
                                  incoming_invite_packet = Some(packet.clone());
                                  remote_addr = Some(src);
                                  current_call_id = call_id.clone();
                                  current_target = Some(src); 
 
-                                 // 180 Ringing Gönder (Çalıyor)
                                  let mut ringing = sentiric_sip_core::builder::SipResponseFactory::create_180_ringing(&packet);
-                                 // To tag ekle
                                  if let Some(to_h) = ringing.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                                      if !to_h.value.contains(";tag=") {
                                          current_to_tag = format!("tag-{:x}", rand::random::<u16>());
@@ -467,6 +458,13 @@ impl SipEngine {
                          let status_code = packet.status_code;
                          
                          if status_code >= 100 && (self.state == CallState::Dialing || self.state == CallState::Registering) {
+                             
+                             // [MİMARİ DÜZELTME]: Timeout Bug Fix (Retransmit'i kes)
+                             if status_code < 200 {
+                                 last_invite_packet = None;
+                                 invite_sent_time = None;
+                             }
+
                              if let Some(via) = packet.get_header_value(HeaderName::Via) {
                                  let (ip, port) = extract_public_addr_from_via(via, &active_contact_ip, active_contact_port);
                                  if ip != active_contact_ip || port != active_contact_port {
@@ -477,7 +475,6 @@ impl SipEngine {
                              }
                          }
 
-                         // 401 UNAUTHORIZED -> MD5 CHALLENGE
                          if status_code == 401 && (self.state == CallState::Registering || self.state == CallState::Dialing) {
                              if let Some(www_auth) = packet.get_header_value(HeaderName::Other("WWW-Authenticate".to_string())) {
                                  let target = current_target.unwrap();
@@ -512,7 +509,6 @@ impl SipEngine {
                              }
                          }
 
-                         // 200 OK -> KAYIT BAŞARILI VEYA ÇAĞRI AÇILDI
                          if status_code == 200 && self.state == CallState::Registering {
                              self.change_state(CallState::Registered);
                              let _ = self.event_tx.try_send(UacEvent::Log("✅ Registered successfully to network!".to_string()));
@@ -523,7 +519,7 @@ impl SipEngine {
                          } 
                          
                          if status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
-                             last_invite_packet = None; // Artık retransmit etme
+                             last_invite_packet = None; 
                              if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
                              
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
@@ -551,7 +547,7 @@ impl SipEngine {
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
                              self.change_state(CallState::Connected);
-                         } else if status_code >= 400 && status_code != 401 { // 401'i yukarıda handle ettik
+                         } else if status_code >= 400 && status_code != 401 {
                              let _ = self.event_tx.try_send(UacEvent::Log(format!("❌ Server rejected with {}", status_code)));
                              self.change_state(CallState::Terminated);
                              if reg_user.is_empty() {
@@ -588,7 +584,6 @@ impl SipEngine {
                 _ = nat_keepalive_interval.tick() => {
                     if self.state == CallState::Registered || self.state == CallState::Connected {
                         if let Some(target) = current_target {
-                            //[MİMARİ]: Ağ güvenliği için UDP Keepalive PING (Boş Satır)
                             let keepalive = b"\r\n\r\n";
                             let _ = sip_socket.send_to(keepalive, target).await;
                         }

@@ -1,12 +1,13 @@
+# Dosya: sentiric-telecom-client-sdk/Cargo.toml
 [package]
 name = "sentiric-telecom-client-sdk"
-version = "0.3.42"
+version = "0.3.43"
 edition = "2021"
 authors = ["Sentiric Team <dev@sentiric.ai>"]
 description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type =["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # --- THE IRON CORE ---
@@ -20,7 +21,7 @@ tracing = "0.1"
 rand = "0.8"
 thiserror = "1.0"
 chrono = "0.4"
-md5 = "0.7" # <--- YENİ EKLENDİ (Digest Auth için)
+md5 = "0.7"
 
 # --- gRPC Telemetry ---
 tonic = "0.12"
