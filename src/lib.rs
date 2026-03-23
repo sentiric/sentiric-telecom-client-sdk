@@ -1,10 +1,11 @@
-// sentiric-telecom-client-sdk/src/lib.rs
+// Dosya: sentiric-telecom-client-sdk/src/lib.rs
 
 pub mod engine;
 pub mod rtp_engine;
 pub mod utils;
 pub mod stun;
-pub mod media; // YENİ: Medya Soyutlama Katmanı
+pub mod media;
+pub mod auth; // YENİ EKLENDİ
 
 use tokio::sync::mpsc;
 
@@ -15,12 +16,15 @@ pub enum UacEvent {
     MediaActive,
     RtpStats { rx_cnt: u64, tx_cnt: u64 },
     Error(String),
-    CallIdGenerated(String), // <--- YENİ EKLENDİ
+    CallIdGenerated(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallState {
     Idle,
+    Registering, // Kayıt olmaya çalışıyor
+    Registered,  // Kayıt başarılı (Yeşil ışık)
+    AuthFailed,  // Yanlış şifre
     Dialing,
     Ringing,
     Connected,
@@ -28,6 +32,12 @@ pub enum CallState {
 }
 
 pub enum ClientCommand {
+    Register {
+        target_ip: String,
+        target_port: u16,
+        user: String,
+        password: String,
+    },
     StartCall {
         target_ip: String,
         target_port: u16,
@@ -64,25 +74,37 @@ impl TelecomClient {
         Self { command_tx: cmd_tx }
     }
 
+    pub async fn register(&self, target_ip: String, target_port: u16, user: String, password: String) -> anyhow::Result<()> {
+        self.command_tx.send(ClientCommand::Register { target_ip, target_port, user, password })
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        Ok(())
+    }
+
     pub async fn start_call(&self, target_ip: String, target_port: u16, to_user: String, from_user: String) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::StartCall { target_ip, target_port, to_user, from_user }).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        self.command_tx.send(ClientCommand::StartCall { target_ip, target_port, to_user, from_user })
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 
     pub async fn end_call(&self) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::EndCall).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        self.command_tx.send(ClientCommand::EndCall)
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
     
-    // YENİ: Mute API
     pub async fn set_mute(&self, muted: bool) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::SetMute { muted }).await.map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        self.command_tx.send(ClientCommand::SetMute { muted })
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 
-    // YENİ: Otomasyon botlarının DTMF basabilmesi için dışa açılan metod
     pub async fn send_dtmf(&self, key: char) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::SendDtmf { key }).await
+        self.command_tx.send(ClientCommand::SendDtmf { key })
+            .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }

@@ -1,4 +1,4 @@
-// sentiric-telecom-client-sdk/src/engine.rs
+// Dosya: sentiric-telecom-client-sdk/src/engine.rs
 
 use crate::{CallState, ClientCommand, UacEvent};
 use crate::rtp_engine::RtpEngine;
@@ -28,7 +28,6 @@ pub struct SipEngine {
     headless: bool,
 }
 
-// Geriye dönük uyumluluk ve güvenlik ağı için reaktif parser
 fn extract_public_addr_from_via(via: &str, fallback_ip: &str, fallback_port: u16) -> (String, u16) {
     let mut ip = fallback_ip.to_string();
     let mut port = fallback_port;
@@ -90,16 +89,22 @@ impl SipEngine {
     }
 
     async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: serde_json::Value) {
+        // [YENİ]: Çalıştığı işletim sistemini dinamik olarak algıla
+        let os_type = std::env::consts::OS;
+        let is_mobile = os_type == "android" || os_type == "ios";
+        let service_name = if is_mobile { "mobile-uac" } else { "desktop-uac" };
+        let host_name = format!("{}-device", os_type);
+
         let json_payload = json!({
             "schema_v": "1.0.0",
             "ts": chrono::Utc::now().to_rfc3339(),
             "severity": severity,
             "tenant_id": "sentiric_demo",
             "resource": {
-                "service.name": "mobile-uac",
+                "service.name": service_name,
                 "service.version": "1.0.0",
                 "service.env": "production",
-                "host.name": "mobile-device"
+                "host.name": host_name
             },
             "trace_id": if call_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(call_id.to_string()) },
             "span_id": serde_json::Value::Null,
@@ -116,7 +121,6 @@ impl SipEngine {
         let local_ip = discover_local_ip();
         let _ = self.event_tx.try_send(UacEvent::Log(format!("🔍 Discovered Local IP: {}", local_ip)));
         
-        // Önce 5060 (SIP ALG tetiklemek için) deniyoruz, olmazsa rastgele port
         let sip_socket = match TokioUdpSocket::bind("0.0.0.0:5060").await {
             Ok(s) => {
                 let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP bound to Port 5060".to_string()));
@@ -150,7 +154,6 @@ impl SipEngine {
         let sip_port = sip_socket.local_addr().unwrap().port();
         let rtp_port = rtp_socket_std.local_addr().unwrap().port();
 
-        // [MİMARİ DÜZELTME]: PROAKTİF STUN KEŞFİ
         let mut public_sip_ip = local_ip.clone();
         let mut public_sip_port = sip_port;
         
@@ -162,7 +165,7 @@ impl SipEngine {
             let _ = self.event_tx.try_send(UacEvent::Log("⚠️ STUN Timeout, falling back to Local IP".to_string()));
         }
 
-        let mut buf = [0u8; 4096];
+        let mut buf =[0u8; 4096];
 
         let mut current_target: Option<SocketAddr> = None;
         let mut current_call_id = String::new();
@@ -170,9 +173,12 @@ impl SipEngine {
         let mut current_to_tag = String::new();
         let mut current_cseq = 0;
 
-        // [KRİTİK]: Baresip uyumluluğu için aktif NAT değişkenleri
         let mut active_contact_ip = public_sip_ip.clone();
         let mut active_contact_port = public_sip_port;
+
+        // AUTH HAFIZASI
+        let mut reg_user = String::new();
+        let mut reg_password = String::new();
 
         let mut last_invite_packet: Option<Vec<u8>> = None;
         let mut retransmit_interval = tokio::time::interval(Duration::from_millis(500));
@@ -188,24 +194,45 @@ impl SipEngine {
             tokio::select! {
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
-                        ClientCommand::StartCall { target_ip, target_port, to_user, from_user } => {
-                            if self.state != CallState::Idle { continue; }
+                        ClientCommand::Register { target_ip, target_port, user, password } => {
+                            if self.state != CallState::Idle && self.state != CallState::AuthFailed { continue; }
                             
                             let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port).parse().unwrap();
-                         
                             current_target = Some(target_addr);
+                            reg_user = user.clone();
+                            reg_password = password;
                             
-                            current_call_id = format!("uac-{:x}", rand::random::<u32>());
-                            
-                            // [YENİ EKLENDİ]: UI'ın takip edebilmesi için Call-ID'yi fırlat
-                            let _ = self.event_tx.try_send(UacEvent::CallIdGenerated(current_call_id.clone()));
-                            
+                            current_call_id = format!("reg-{:x}", rand::random::<u32>());
                             current_from_tag = format!("tag-{:x}", rand::random::<u16>());
-
                             current_cseq = 1;
 
-                            // --- BARESIP-LIKE AKILLI NAT (INTELLIGENT ROUTING) ---
-                            // Hedef VPN veya LAN ise STUN IP'sini çöpe atıp fiziksel IP'yi kullanıyoruz.
+                            let mut reg = SipPacket::new_request(Method::Register, format!("sip:{}", target_ip));
+                            let branch = sentiric_sip_core::utils::generate_branch_id();
+
+                            reg.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
+                            reg.headers.push(Header::new(HeaderName::From, format!("<sip:{}@{}>;tag={}", user, target_ip, current_from_tag)));
+                            reg.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", user, target_ip)));
+                            reg.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
+                            reg.headers.push(Header::new(HeaderName::CSeq, format!("{} REGISTER", current_cseq)));
+                            reg.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", user, active_contact_ip, active_contact_port)));
+                            reg.headers.push(Header::new(HeaderName::Other("Expires".to_string()), "3600".to_string()));
+                            reg.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
+
+                            let _ = sip_socket.send_to(&reg.to_bytes(), target_addr).await;
+                            let _ = self.event_tx.try_send(UacEvent::Log("⬆️ Initial REGISTER sent (No Auth)".to_string()));
+                            self.change_state(CallState::Registering);
+                        },
+
+                        ClientCommand::StartCall { target_ip, target_port, to_user, from_user } => {
+                            if self.state != CallState::Idle && self.state != CallState::Registered { continue; }
+                            
+                            let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port).parse().unwrap();
+                            current_target = Some(target_addr);
+                            current_call_id = format!("uac-{:x}", rand::random::<u32>());
+                            let _ = self.event_tx.try_send(UacEvent::CallIdGenerated(current_call_id.clone()));
+                            current_from_tag = format!("tag-{:x}", rand::random::<u16>());
+                            current_cseq = 1;
+
                             active_contact_ip = public_sip_ip.clone();
                             active_contact_port = public_sip_port;
 
@@ -213,10 +240,9 @@ impl SipEngine {
                                 if dummy.connect(target_addr).is_ok() {
                                     if let Ok(local_addr) = dummy.local_addr() {
                                         let lip = local_addr.ip().to_string();
-                                        // 100.x = Tailscale/VPN, 10.x / 192.168.x / 172.x = LAN
                                         if target_ip.starts_with("100.") || target_ip.starts_with("10.") || target_ip.starts_with("192.168.") || target_ip.starts_with("172.") {
                                             active_contact_ip = lip;
-                                            active_contact_port = sip_port; // Orijinal fiziksel port
+                                            active_contact_port = sip_port;
                                             let _ = self.event_tx.try_send(UacEvent::Log(format!("🛡️ VPN/LAN Detected. STUN bypassed -> SDP set to {}", active_contact_ip)));
                                         }
                                     }
@@ -226,7 +252,6 @@ impl SipEngine {
                             let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}@{}:{}", to_user, target_ip, target_port));
                             let branch = sentiric_sip_core::utils::generate_branch_id();
 
-                            // [KRİTİK]: Tüm başlıklar active_contact_ip ile yapılandırıldı.
                             invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
                             invite.headers.push(Header::new(HeaderName::From, format!("<sip:{}@{}>;tag={}", from_user, target_ip, current_from_tag)));
                             invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", to_user, target_ip)));
@@ -235,11 +260,10 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, active_contact_ip, active_contact_port)));
                             
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/3.0".to_string()));
+                            invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                             invite.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
-                            // Asterisk Strict Latching sorunu çözüldü.
                             let sdp = format!(
                                 "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
                                 now, now, active_contact_ip, active_contact_ip, rtp_port
@@ -259,7 +283,7 @@ impl SipEngine {
                         
                         ClientCommand::EndCall => {
                              last_invite_packet = None;
-                             if self.state != CallState::Idle {
+                             if self.state != CallState::Idle && self.state != CallState::Registered && self.state != CallState::Registering {
                                 if let Some(target) = current_target {
                                     let mut bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
                                     let branch = sentiric_sip_core::utils::generate_branch_id();
@@ -279,7 +303,12 @@ impl SipEngine {
                                 }
                                 if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                 self.change_state(CallState::Terminated);
-                                self.change_state(CallState::Idle);
+                                // Eğer şifreliydiysek Registered'a dön
+                                if reg_user.is_empty() {
+                                    self.change_state(CallState::Idle);
+                                } else {
+                                    self.change_state(CallState::Registered);
+                                }
                                 media_active_reported = false;
                             }
                         },
@@ -296,7 +325,6 @@ impl SipEngine {
                                 let _ = self.event_tx.try_send(UacEvent::Log(format!("🎹 In-Band DTMF Injecting: {}", key)));
                             }
                         },      
-                                                // YENİ: Mute Komutu Yakalayıcı
                         ClientCommand::SetMute { muted } => {
                             if let Some(rtp) = &self.rtp_engine {
                                 rtp.set_mute(muted);
@@ -316,15 +344,14 @@ impl SipEngine {
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
                          
-                         // 1. SUNUCUDAN GELEN ISTEKLERI (REQUESTS) YAKALA
                          if packet.is_request() {
                              if packet.method == Method::Bye {
-                                 let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection (BYE). Hanging up!".to_string()));
+                                 let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection (BYE).".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
                                  
-                                 let mut ok_resp = SipPacket::create_response_for(&packet, 200, "OK".to_string());
+                                 let mut ok_resp = sentiric_sip_core::builder::SipResponseFactory::create_200_ok(&packet);
                                  ok_resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
-                                 ok_resp.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/3.0".to_string()));
+                                 ok_resp.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                                  
                                  let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
                                  let _ = self.event_tx.try_send(UacEvent::Log("⬆️ 200 OK (For BYE) sent".to_string()));
@@ -332,19 +359,20 @@ impl SipEngine {
                                  if let Some(rtp) = &self.rtp_engine { rtp.stop(); }
                                  
                                  self.change_state(CallState::Terminated);
-                                 self.change_state(CallState::Idle);
+                                 if reg_user.is_empty() {
+                                     self.change_state(CallState::Idle);
+                                 } else {
+                                     self.change_state(CallState::Registered);
+                                 }
                                  media_active_reported = false;
                                  last_invite_packet = None;
                              }
                              continue; 
                          }
 
-                         // 2. SUNUCUDAN GELEN CEVAPLAR (RESPONSES)
                          let status_code = packet.status_code;
                          
-                         // [GÜVENLİK AĞI]: Reactive NAT Update - Asterisk ne gördüyse onu kullan
-                         if status_code >= 100 && self.state == CallState::Dialing {
-                             last_invite_packet = None;
+                         if status_code >= 100 && (self.state == CallState::Dialing || self.state == CallState::Registering) {
                              if let Some(via) = packet.get_header_value(HeaderName::Via) {
                                  let (ip, port) = extract_public_addr_from_via(via, &active_contact_ip, active_contact_port);
                                  if ip != active_contact_ip || port != active_contact_port {
@@ -354,12 +382,54 @@ impl SipEngine {
                                  }
                              }
                          }
+
+                         // 401 UNAUTHORIZED -> MD5 CHALLENGE
+                         if status_code == 401 && (self.state == CallState::Registering || self.state == CallState::Dialing) {
+                             if let Some(www_auth) = packet.get_header_value(HeaderName::Other("WWW-Authenticate".to_string())) {
+                                 let target = current_target.unwrap();
+                                 let method_str = if self.state == CallState::Registering { "REGISTER" } else { "INVITE" };
+                                 
+                                 if let Some(auth_header) = crate::auth::generate_auth_header(&reg_user, &reg_password, method_str, &format!("sip:{}", target.ip()), www_auth) {
+                                     current_cseq += 1;
+                                     
+                                     let method = if self.state == CallState::Registering { Method::Register } else { Method::Invite };
+                                     let mut auth_req = SipPacket::new_request(method, format!("sip:{}", target.ip()));
+                                     let branch = sentiric_sip_core::utils::generate_branch_id();
+
+                                     auth_req.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
+                                     auth_req.headers.push(Header::new(HeaderName::From, format!("<sip:{}@{}>;tag={}", reg_user, target.ip(), current_from_tag)));
+                                     auth_req.headers.push(Header::new(HeaderName::To, format!("<sip:{}@{}>", reg_user, target.ip())));
+                                     auth_req.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
+                                     auth_req.headers.push(Header::new(HeaderName::CSeq, format!("{} {}", current_cseq, method_str)));
+                                     auth_req.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", reg_user, active_contact_ip, active_contact_port)));
+                                     
+                                     if self.state == CallState::Registering {
+                                         auth_req.headers.push(Header::new(HeaderName::Other("Expires".to_string()), "3600".to_string()));
+                                     }
+                                     
+                                     auth_req.headers.push(Header::new(HeaderName::Other("Authorization".to_string()), auth_header));
+                                     auth_req.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
+
+                                     let _ = sip_socket.send_to(&auth_req.to_bytes(), target).await;
+                                     let _ = self.event_tx.try_send(UacEvent::Log(format!("🔑 Sent 401 Challenge Response for {}", method_str)));
+                                 } else {
+                                     self.change_state(CallState::AuthFailed);
+                                 }
+                             }
+                         }
+
+                         // 200 OK -> KAYIT BAŞARILI VEYA ÇAĞRI AÇILDI
+                         if status_code == 200 && self.state == CallState::Registering {
+                             self.change_state(CallState::Registered);
+                             let _ = self.event_tx.try_send(UacEvent::Log("✅ Registered successfully to network!".to_string()));
+                         }
                          
                          if status_code == 180 || status_code == 183 {
                              self.change_state(CallState::Ringing);
                          } 
                          
                          if status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
+                             last_invite_packet = None; // Artık retransmit etme
                              if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
                              
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
@@ -378,7 +448,7 @@ impl SipEngine {
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                              ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", current_cseq)));
                              ack.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
-                             ack.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/3.0".to_string()));
+                             ack.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                              
                              if let Some(target) = current_target {
                                  let ack_bytes = ack.to_bytes();
@@ -386,10 +456,14 @@ impl SipEngine {
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
                              self.change_state(CallState::Connected);
-                         } else if status_code >= 400 {
+                         } else if status_code >= 400 && status_code != 401 { // 401'i yukarıda handle ettik
                              let _ = self.event_tx.try_send(UacEvent::Log(format!("❌ Server rejected with {}", status_code)));
                              self.change_state(CallState::Terminated);
-                             self.change_state(CallState::Idle);
+                             if reg_user.is_empty() {
+                                 self.change_state(CallState::Idle);
+                             } else {
+                                 self.change_state(CallState::Registered);
+                             }
                              last_invite_packet = None;
                          }
                     }
@@ -403,7 +477,11 @@ impl SipEngine {
                                     let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Connection Timeout!".to_string()));
                                     last_invite_packet = None;
                                     self.change_state(CallState::Terminated);
-                                    self.change_state(CallState::Idle);
+                                    if reg_user.is_empty() {
+                                        self.change_state(CallState::Idle);
+                                    } else {
+                                        self.change_state(CallState::Registered);
+                                    }
                                 } else {
                                     let _ = sip_socket.send_to(packet, target).await;
                                 }
@@ -413,8 +491,9 @@ impl SipEngine {
                 },
 
                 _ = nat_keepalive_interval.tick() => {
-                    if self.state != CallState::Idle {
+                    if self.state == CallState::Registered || self.state == CallState::Connected {
                         if let Some(target) = current_target {
+                            //[MİMARİ]: Ağ güvenliği için UDP Keepalive PING (Boş Satır)
                             let keepalive = b"\r\n\r\n";
                             let _ = sip_socket.send_to(keepalive, target).await;
                         }
