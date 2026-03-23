@@ -5,7 +5,7 @@ pub mod rtp_engine;
 pub mod utils;
 pub mod stun;
 pub mod media;
-pub mod auth; // YENİ EKLENDİ
+pub mod auth;
 
 use tokio::sync::mpsc;
 
@@ -17,16 +17,19 @@ pub enum UacEvent {
     RtpStats { rx_cnt: u64, tx_cnt: u64 },
     Error(String),
     CallIdGenerated(String),
+    // [YENİ]: Gelen arama bilgisini ve Call-ID'yi Flutter'a iletir
+    IncomingCall { from: String, call_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallState {
     Idle,
-    Registering, // Kayıt olmaya çalışıyor
-    Registered,  // Kayıt başarılı (Yeşil ışık)
-    AuthFailed,  // Yanlış şifre
+    Registering,
+    Registered,
+    AuthFailed,
     Dialing,
     Ringing,
+    Incoming, //[YENİ]: Telefon çalıyor (Gelen Çağrı)
     Connected,
     Terminated,
 }
@@ -45,6 +48,10 @@ pub enum ClientCommand {
         from_user: String,
     },
     EndCall,
+    // [YENİ]: Gelen aramayı cevapla
+    AcceptCall,
+    // [YENİ]: Gelen aramayı reddet
+    RejectCall,
     UpdateSettings {
         mic_gain: f32,
         speaker_gain: f32,
@@ -83,6 +90,22 @@ impl TelecomClient {
 
     pub async fn start_call(&self, target_ip: String, target_port: u16, to_user: String, from_user: String) -> anyhow::Result<()> {
         self.command_tx.send(ClientCommand::StartCall { target_ip, target_port, to_user, from_user })
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        Ok(())
+    }
+
+    // [YENİ]: Cevapla
+    pub async fn accept_call(&self) -> anyhow::Result<()> {
+        self.command_tx.send(ClientCommand::AcceptCall)
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
+        Ok(())
+    }
+
+    // [YENİ]: Reddet
+    pub async fn reject_call(&self) -> anyhow::Result<()> {
+        self.command_tx.send(ClientCommand::RejectCall)
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
