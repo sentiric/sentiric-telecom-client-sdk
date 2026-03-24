@@ -69,13 +69,26 @@ impl HardwareAdapter {
                     None => { let _ = ready_tx.send(Err(anyhow::anyhow!("No output device"))); return; }
                 };
 
-                // [ARCH-COMPLIANCE]: Donanımın varsayılan konfigürasyonu (Kanal Sayısı vb.) kabul edilir. 
-                // Bu, Mono dayatması nedeniyle gerçekleşen Android çökmelerini engeller.
-                let input_config = input_device.default_input_config()
-                    .map(|c| c.into())
-                    .unwrap_or_else(|_| cpal::StreamConfig {
+                // [ARCH-COMPLIANCE]: Donanımın desteklediği en güvenli konfigürasyonu ara.
+                // 16kHz Mono dayatması yerine, cihazın desteklediği kanallara adapte olunarak Android AudioRecord çökmeleri giderildi.
+                let mut input_config = None;
+                if let Ok(mut configs) = input_device.supported_input_configs() {
+                    if let Some(c) = configs.find(|c| c.channels() == 1 && c.min_sample_rate().0 <= 16000 && c.max_sample_rate().0 >= 16000) {
+                        input_config = Some(c.with_sample_rate(cpal::SampleRate(16000)).into());
+                    }
+                }
+                if input_config.is_none() {
+                    if let Ok(mut configs) = input_device.supported_input_configs() {
+                        if let Some(c) = configs.find(|c| c.channels() == 1) {
+                            input_config = Some(c.with_max_sample_rate().into());
+                        }
+                    }
+                }
+                let input_config = input_config.unwrap_or_else(|| {
+                    input_device.default_input_config().map(|c| c.into()).unwrap_or(cpal::StreamConfig {
                         channels: 1, sample_rate: cpal::SampleRate(16000), buffer_size: cpal::BufferSize::Default,
-                    });
+                    })
+                });
 
                 let output_config = output_device.default_output_config()
                     .map(|c| c.into())
@@ -100,7 +113,7 @@ impl HardwareAdapter {
                             if in_channels == 1 {
                                 for &s in data { let _ = producer.push(s * gain); }
                             } else {
-                                // Stereo cihazlar için DSP Downmix (Mono'ya indirgeme)
+                                // DSP Downmix: Stereo mikrofon verisini yazılımsal olarak Mono'ya indirge
                                 for frame in data.chunks(in_channels) {
                                     let avg = frame.iter().sum::<f32>() / in_channels as f32;
                                     let _ = producer.push(avg * gain);
