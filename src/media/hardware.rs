@@ -1,5 +1,4 @@
-// sentiric-telecom-client-sdk/src/media/hardware.rs
-
+// Dosya: sentiric-telecom-client-sdk/src/media/hardware.rs
 use super::adapter::MediaAdapter;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{HeapRb, SharedRb, Producer, Consumer};
@@ -7,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tracing::{error, info};
 
-// Karmaşık RingBuf tiplerini gizliyoruz
 type RbProd = Producer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 
@@ -20,7 +18,6 @@ pub struct HardwareAdapter {
     is_healthy: Arc<AtomicBool>,
     hw_sample_rate_in: usize,
     hw_sample_rate_out: usize,
-    // Stream'leri yaşatan bekçi kanalı. Send + Sync garantilidir.
     _keep_alive_tx: std::sync::mpsc::Sender<()>, 
 }
 
@@ -41,14 +38,12 @@ impl HardwareAdapter {
         let mic_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let spk_gain = Arc::new(AtomicU32::new(1.2f32.to_bits()));
 
-        // Sample rate'leri thread'den dışarı taşıyabilmek için atomikler kullanıyoruz
         let hw_sample_rate_in = Arc::new(AtomicU32::new(16000));
         let hw_sample_rate_out = Arc::new(AtomicU32::new(16000));
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
         let (keep_alive_tx, keep_alive_rx) = std::sync::mpsc::channel::<()>();
 
-        // Closure (Thread) içine taşınacak referans kopyaları
         let t_prod = shared_mic_prod.clone();
         let t_cons = shared_spk_cons.clone();
         let t_l_mic = mic_gain.clone();
@@ -59,8 +54,6 @@ impl HardwareAdapter {
         let t_sr_in = hw_sample_rate_in.clone();
         let t_sr_out = hw_sample_rate_out.clone();
 
-        // [MİMARİ: THE TRUE KEEPER THREAD]
-        // cpal::Stream nesneleri (!Send) asla bu thread'in dışına çıkmaz.
         std::thread::Builder::new()
             .name("cpal-keeper".into())
             .spawn(move || {
@@ -76,15 +69,12 @@ impl HardwareAdapter {
                     None => { let _ = ready_tx.send(Err(anyhow::anyhow!("No output device"))); return; }
                 };
 
-                let mut input_config: Option<cpal::StreamConfig> = None;
-                if let Ok(mut configs) = input_device.supported_input_configs() {
-                    if let Some(mono) = configs.find(|c| c.channels() == 1) {
-                        input_config = Some(mono.with_max_sample_rate().into());
-                    }
-                }
-                let input_config = input_config.unwrap_or_else(|| cpal::StreamConfig {
-                    channels: 1, sample_rate: cpal::SampleRate(16000), buffer_size: cpal::BufferSize::Default,
-                });
+                // [ARCH-COMPLIANCE]: Donanımın varsayılan input kanalını kabul et. Mono dayatması Android'i çökertiyordu.
+                let input_config = input_device.default_input_config()
+                    .map(|c| c.into())
+                    .unwrap_or_else(|_| cpal::StreamConfig {
+                        channels: 1, sample_rate: cpal::SampleRate(16000), buffer_size: cpal::BufferSize::Default,
+                    });
 
                 let output_config = output_device.default_output_config()
                     .map(|c| c.into())
@@ -100,7 +90,6 @@ impl HardwareAdapter {
                 
                 let mut last_sample_out = 0.0f32;
 
-                // Giriş (Mic) Akışı
                 let input_stream = match input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _: &_| {
@@ -110,6 +99,7 @@ impl HardwareAdapter {
                             if in_channels == 1 {
                                 for &s in data { let _ = producer.push(s * gain); }
                             } else {
+                                // Stereo mikrofonlar için (Android cihazlarda çok yaygındır) Downmix işlemi
                                 for frame in data.chunks(in_channels) {
                                     let avg = frame.iter().sum::<f32>() / in_channels as f32;
                                     let _ = producer.push(avg * gain);
@@ -124,7 +114,6 @@ impl HardwareAdapter {
                     Err(e) => { let _ = ready_tx.send(Err(anyhow::anyhow!("Mic build fail: {}", e))); return; }
                 };
 
-                // Çıkış (Hoparlör) Akışı
                 let output_stream = match output_device.build_output_stream(
                     &output_config,
                     move |data: &mut [f32], _: &_| {
@@ -153,15 +142,11 @@ impl HardwareAdapter {
                 if let Err(e) = input_stream.play() { let _ = ready_tx.send(Err(anyhow::anyhow!("Mic play fail: {}", e))); return; }
                 if let Err(e) = output_stream.play() { let _ = ready_tx.send(Err(anyhow::anyhow!("Spk play fail: {}", e))); return; }
 
-                // Hazır olduğunu ana thread'e bildir
                 let _ = ready_tx.send(Ok(()));
-                
-                // Bu thread burada uyuyarak stream'leri bellekte yaşatır.
                 let _ = keep_alive_rx.recv();
                 info!("Hardware Adapter dropped. Audio streams closed safely.");
             })?;
 
-        // Thread'in sonucu dönmesini bekle
         ready_rx.recv().map_err(|e| anyhow::anyhow!("Thread communication error: {}", e))??;
 
         Ok(Self {
@@ -187,7 +172,7 @@ impl MediaAdapter for HardwareAdapter {
         
         if self.is_muted.load(Ordering::Relaxed) {
             for _ in 0..cons.len() { let _ = cons.pop(); }
-            return vec![0; target_8k_samples]; // Saf sessizlik
+            return vec![0; target_8k_samples]; 
         }
 
         if cons.len() < hw_frame_size {
