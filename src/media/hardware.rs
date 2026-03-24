@@ -69,7 +69,8 @@ impl HardwareAdapter {
                     None => { let _ = ready_tx.send(Err(anyhow::anyhow!("No output device"))); return; }
                 };
 
-                // [ARCH-COMPLIANCE]: Donanımın varsayılan input kanalını kabul et. Mono dayatması Android'i çökertiyordu.
+                // [ARCH-COMPLIANCE]: Donanımın varsayılan konfigürasyonu (Kanal Sayısı vb.) kabul edilir. 
+                // Bu, Mono dayatması nedeniyle gerçekleşen Android çökmelerini engeller.
                 let input_config = input_device.default_input_config()
                     .map(|c| c.into())
                     .unwrap_or_else(|_| cpal::StreamConfig {
@@ -99,7 +100,7 @@ impl HardwareAdapter {
                             if in_channels == 1 {
                                 for &s in data { let _ = producer.push(s * gain); }
                             } else {
-                                // Stereo mikrofonlar için (Android cihazlarda çok yaygındır) Downmix işlemi
+                                // Stereo cihazlar için DSP Downmix (Mono'ya indirgeme)
                                 for frame in data.chunks(in_channels) {
                                     let avg = frame.iter().sum::<f32>() / in_channels as f32;
                                     let _ = producer.push(avg * gain);
