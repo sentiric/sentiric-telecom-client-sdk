@@ -1,10 +1,13 @@
 // Dosya: sentiric-telecom-client-sdk/src/media/hardware.rs
+
+// [ARCH-COMPLIANCE] Mobil donanım erişimi için standart log kullanımına dönüldü.
+use log::{error, info};
+
 use super::adapter::MediaAdapter;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{HeapRb, SharedRb, Producer, Consumer};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use tracing::{error, info};
 
 type RbProd = Producer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
@@ -119,8 +122,7 @@ impl HardwareAdapter {
                         }
                     },
                     move |e| { 
-                        // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata eklendi.
-                        error!(event="HW_MIC_ERROR", "Mic Error: {}", e); 
+                        error!("Mic Error: {}", e); 
                         t_healthy_in.store(false, Ordering::SeqCst); 
                     },
                     None
@@ -148,8 +150,7 @@ impl HardwareAdapter {
                         }
                     },
                     move |e| { 
-                        // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata eklendi.
-                        error!(event="HW_SPK_ERROR", "Spk Error: {}", e); 
+                        error!("Spk Error: {}", e); 
                         t_healthy_out.store(false, Ordering::SeqCst); 
                     },
                     None
@@ -163,9 +164,9 @@ impl HardwareAdapter {
 
                 let _ = ready_tx.send(Ok(()));
                 let _ = keep_alive_rx.recv();
-                
-                // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata eklendi.
-                info!(event="HW_ADAPTER_DROPPED", "Hardware Adapter dropped. Audio streams closed safely.");
+
+                info!("Hardware Adapter dropped. Audio streams closed safely.");
+           
             })?;
 
         ready_rx.recv().map_err(|e| anyhow::anyhow!("Thread communication error: {}", e))??;
