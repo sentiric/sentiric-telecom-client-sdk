@@ -69,8 +69,6 @@ impl HardwareAdapter {
                     None => { let _ = ready_tx.send(Err(anyhow::anyhow!("No output device"))); return; }
                 };
 
-                // [ARCH-COMPLIANCE]: Donanımın desteklediği en güvenli konfigürasyonu ara.
-                // 16kHz Mono dayatması yerine, cihazın desteklediği kanallara adapte olunarak Android AudioRecord çökmeleri giderildi.
                 let mut input_config = None;
                 if let Ok(mut configs) = input_device.supported_input_configs() {
                     if let Some(c) = configs.find(|c| c.channels() == 1 && c.min_sample_rate().0 <= 16000 && c.max_sample_rate().0 >= 16000) {
@@ -113,7 +111,6 @@ impl HardwareAdapter {
                             if in_channels == 1 {
                                 for &s in data { let _ = producer.push(s * gain); }
                             } else {
-                                // DSP Downmix: Stereo mikrofon verisini yazılımsal olarak Mono'ya indirge
                                 for frame in data.chunks(in_channels) {
                                     let avg = frame.iter().sum::<f32>() / in_channels as f32;
                                     let _ = producer.push(avg * gain);
@@ -121,7 +118,11 @@ impl HardwareAdapter {
                             }
                         }
                     },
-                    move |e| { error!("Mic Error: {}", e); t_healthy_in.store(false, Ordering::SeqCst); },
+                    move |e| { 
+                        // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata eklendi.
+                        error!(event="HW_MIC_ERROR", "Mic Error: {}", e); 
+                        t_healthy_in.store(false, Ordering::SeqCst); 
+                    },
                     None
                 ) {
                     Ok(s) => s,
@@ -146,7 +147,11 @@ impl HardwareAdapter {
                             for s in data.iter_mut() { *s = 0.0; }
                         }
                     },
-                    move |e| { error!("Spk Error: {}", e); t_healthy_out.store(false, Ordering::SeqCst); },
+                    move |e| { 
+                        // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata eklendi.
+                        error!(event="HW_SPK_ERROR", "Spk Error: {}", e); 
+                        t_healthy_out.store(false, Ordering::SeqCst); 
+                    },
                     None
                 ) {
                     Ok(s) => s,
@@ -158,7 +163,9 @@ impl HardwareAdapter {
 
                 let _ = ready_tx.send(Ok(()));
                 let _ = keep_alive_rx.recv();
-                info!("Hardware Adapter dropped. Audio streams closed safely.");
+                
+                // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata eklendi.
+                info!(event="HW_ADAPTER_DROPPED", "Hardware Adapter dropped. Audio streams closed safely.");
             })?;
 
         ready_rx.recv().map_err(|e| anyhow::anyhow!("Thread communication error: {}", e))??;

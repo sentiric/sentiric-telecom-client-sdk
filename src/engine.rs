@@ -83,7 +83,8 @@ impl SipEngine {
 
     fn change_state(&mut self, new_state: CallState) {
         if self.state != new_state {
-            tracing::info!("🔄 SIP State Transition: {:?} -> {:?}", self.state, new_state);
+            // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata zorunluluğu giderildi.
+            tracing::info!(event="SIP_STATE_TRANSITION", old_state=?self.state, new_state=?new_state, "🔄 SIP State Transition: {:?} -> {:?}", self.state, new_state);
             self.state = new_state.clone();
             let _ = self.event_tx.try_send(UacEvent::CallStateChanged(new_state));
         }
