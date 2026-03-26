@@ -466,23 +466,22 @@ impl SipEngine {
 
                          let status_code = packet.status_code;
                          
-                         if status_code >= 100 && (self.state == CallState::Dialing || self.state == CallState::Registering) {
-                             
-                             // [MİMARİ DÜZELTME]: Timeout Bug Fix (Retransmit'i kes)
-                             if status_code < 200 {
-                                 last_invite_packet = None;
-                                 invite_sent_time = None;
-                             }
+                        // [ARCH-COMPLIANCE] Satır ~400: Gelen HTTP 1xx (Provisional) yanıtlarındaki hata düzeltildi.
+                        if status_code >= 100 && (self.state == CallState::Dialing || self.state == CallState::Registering) {
+                            if status_code < 200 {
+                                last_invite_packet = None; // Tekrar INVITE atmayı kes
+                                // invite_sent_time = None;  <--- SİLİNDİ: Genel zaman aşımı (Timeout) sayacı çalışmaya devam etmeli!
+                            }
 
-                             if let Some(via) = packet.get_header_value(HeaderName::Via) {
-                                 let (ip, port) = extract_public_addr_from_via(via, &active_contact_ip, active_contact_port);
-                                 if ip != active_contact_ip || port != active_contact_port {
-                                     let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 Reactive NAT Update: {}:{}", ip, port)));
-                                     active_contact_ip = ip;
-                                     active_contact_port = port;
-                                 }
-                             }
-                         }
+                            if let Some(via) = packet.get_header_value(HeaderName::Via) {
+                                let (ip, port) = extract_public_addr_from_via(via, &active_contact_ip, active_contact_port);
+                                if ip != active_contact_ip || port != active_contact_port {
+                                    let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 Reactive NAT Update: {}:{}", ip, port)));
+                                    active_contact_ip = ip;
+                                    active_contact_port = port;
+                                }
+                            }
+                        }
 
                          if status_code == 401 && (self.state == CallState::Registering || self.state == CallState::Dialing) {
                              if let Some(www_auth) = packet.get_header_value(HeaderName::Other("WWW-Authenticate".to_string())) {
@@ -528,8 +527,10 @@ impl SipEngine {
                          } 
                          
                          if status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
-                             last_invite_packet = None; 
-                             if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
+                            last_invite_packet = None; 
+                            invite_sent_time = None; // <--- EKLENDİ: Başarılı bağlantıda sayaç durdurulur.
+                           
+                            if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
                              
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
                                  self.send_telemetry("INFO", "SDP_PARSED", "Media target locked", &current_call_id, json!({"target": rtp_target.to_string()})).await;
@@ -556,36 +557,45 @@ impl SipEngine {
                                  let _ = sip_socket.send_to(&ack_bytes, target).await;
                              }
                              self.change_state(CallState::Connected);
-                         } else if status_code >= 400 && status_code != 401 {
-                             let _ = self.event_tx.try_send(UacEvent::Log(format!("❌ Server rejected with {}", status_code)));
-                             self.change_state(CallState::Terminated);
-                             if reg_user.is_empty() {
-                                 self.change_state(CallState::Idle);
-                             } else {
-                                 self.change_state(CallState::Registered);
-                             }
-                             last_invite_packet = None;
-                         }
+                        } else if status_code >= 400 && status_code != 401 {
+                            let _ = self.event_tx.try_send(UacEvent::Log(format!("❌ Server rejected with {}", status_code)));
+                            self.change_state(CallState::Terminated);
+                            if reg_user.is_empty() {
+                                self.change_state(CallState::Idle);
+                            } else {
+                                self.change_state(CallState::Registered);
+                            }
+                            last_invite_packet = None;
+                            invite_sent_time = None; // <--- EKLENDİ: Reddedilmede sayaç durdurulur.
+                        }
                     }
                 },
 
                 _ = retransmit_interval.tick() => {
+                    // 1. GENEL ZAMAN AŞIMI KONTROLÜ (15 Saniye)
+                    if let Some(start_time) = invite_sent_time {
+                        if start_time.elapsed() > Duration::from_secs(15) {
+                            let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Connection Timeout (No Response)!".to_string()));
+                            last_invite_packet = None;
+                            invite_sent_time = None;
+                            self.change_state(CallState::Terminated);
+                            if reg_user.is_empty() {
+                                self.change_state(CallState::Idle);
+                            } else {
+                                self.change_state(CallState::Registered);
+                            }
+                            if let Some(rtp) = &self.rtp_engine {
+                                rtp.stop();
+                                rtp.reset_stats();
+                            }
+                            continue; // Retransmit işlemine geçmeden döngüyü atla
+                        }
+                    }
+
+                    // 2. RETRANSMIT İŞLEMİ (Eğer 1xx yanıtı gelmediyse çalışır)
                     if let Some(packet) = &last_invite_packet {
                         if let Some(target) = current_target {
-                            if let Some(start_time) = invite_sent_time {
-                                if start_time.elapsed() > Duration::from_secs(5) {
-                                    let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Connection Timeout!".to_string()));
-                                    last_invite_packet = None;
-                                    self.change_state(CallState::Terminated);
-                                    if reg_user.is_empty() {
-                                        self.change_state(CallState::Idle);
-                                    } else {
-                                        self.change_state(CallState::Registered);
-                                    }
-                                } else {
-                                    let _ = sip_socket.send_to(packet, target).await;
-                                }
-                            }
+                            let _ = sip_socket.send_to(packet, target).await;
                         }
                     }
                 },
