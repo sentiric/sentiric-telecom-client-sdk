@@ -572,10 +572,33 @@ impl SipEngine {
                 },
 
                 _ = retransmit_interval.tick() => {
-                    // 1. GENEL ZAMAN AŞIMI KONTROLÜ (15 Saniye)
+                    // 1. GENEL ZAMAN AŞIMI KONTROLÜ (45 Saniye)
                     if let Some(start_time) = invite_sent_time {
-                        if start_time.elapsed() > Duration::from_secs(15) {
-                            let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Connection Timeout (No Response)!".to_string()));
+                        if start_time.elapsed() > Duration::from_secs(45) { // 15'ten 45'e çıkarıldı
+                            let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Ringing Timeout (No Answer)!".to_string()));
+                            
+                            // [CRITICAL FIX]: Timeout olduğunda ağa CANCEL göndererek karşı tarafın çalmasını durdur!
+                            if (self.state == CallState::Dialing || self.state == CallState::Ringing) && current_target.is_some() {
+                                if let Some(target) = current_target {
+                                    let mut cancel = SipPacket::new_request(Method::Cancel, format!("sip:{}", target));
+                                    let branch = last_invite_packet.as_ref()
+                                        .and_then(|p| parser::parse(p).ok())
+                                        .and_then(|p| p.get_header_value(HeaderName::Via).cloned())
+                                        .and_then(|v| v.split("branch=").nth(1).map(|s| s.split(';').next().unwrap_or("").to_string()))
+                                        .unwrap_or_else(|| sentiric_sip_core::utils::generate_branch_id());
+                                    
+                                    cancel.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
+                                    cancel.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
+                                    cancel.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
+                                    cancel.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
+                                    cancel.headers.push(Header::new(HeaderName::CSeq, format!("{} CANCEL", current_cseq)));
+                                    cancel.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
+                                    
+                                    let _ = sip_socket.send_to(&cancel.to_bytes(), target).await;
+                                    let _ = self.event_tx.try_send(UacEvent::Log("⬆️ CANCEL sent due to timeout".to_string()));
+                                }
+                            }
+
                             last_invite_packet = None;
                             invite_sent_time = None;
                             self.change_state(CallState::Terminated);
@@ -588,11 +611,11 @@ impl SipEngine {
                                 rtp.stop();
                                 rtp.reset_stats();
                             }
-                            continue; // Retransmit işlemine geçmeden döngüyü atla
+                            continue; 
                         }
                     }
 
-                    // 2. RETRANSMIT İŞLEMİ (Eğer 1xx yanıtı gelmediyse çalışır)
+                    // 2. RETRANSMIT İŞLEMİ
                     if let Some(packet) = &last_invite_packet {
                         if let Some(target) = current_target {
                             let _ = sip_socket.send_to(packet, target).await;
