@@ -1,7 +1,7 @@
 # Dosya: sentiric-telecom-client-sdk/Cargo.toml
 [package]
 name = "sentiric-telecom-client-sdk"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 authors = ["Sentiric Team <dev@sentiric.ai>"]
 description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"

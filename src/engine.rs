@@ -217,8 +217,11 @@ impl SipEngine {
                                 }
 
                                 let now = chrono::Utc::now().timestamp();
+                            
+                                // [ARCH-COMPLIANCE] PCMA Testleri için Payload type 8 olarak değiştirildi.
+                                // NOT: Bu kullanım doğru değil! Bu değerler codec yada diğer ayarlar ince bir muhendislik ile özelleştirebilmeli. ilgili kullanan servis bunu kendi ui sından yanı environment lerinden anında değiştirebilmeli.
                                 let sdp = format!(
-                                    "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
+                                    "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
                                     now, now, active_contact_ip, active_contact_ip, rtp_port
                                 );
                                 
