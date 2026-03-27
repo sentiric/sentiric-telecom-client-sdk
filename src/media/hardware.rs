@@ -1,13 +1,12 @@
-// Dosya: sentiric-telecom-client-sdk/src/media/hardware.rs
+// Dosya: src/media/hardware.rs
 
-// [ARCH-COMPLIANCE] Mobil donanım erişimi için standart log kullanımına dönüldü.
 use log::{error, info};
-
 use super::adapter::MediaAdapter;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{HeapRb, SharedRb, Producer, Consumer};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use sentiric_rtp_core::AudioResampler;
 
 type RbProd = Producer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
@@ -20,8 +19,11 @@ pub struct HardwareAdapter {
     is_muted: Arc<AtomicBool>,
     is_healthy: Arc<AtomicBool>,
     hw_sample_rate_in: usize,
-    hw_sample_rate_out: usize,
+    // hw_sample_rate_out kaldırıldı (Dead code engellemesi)
     _keep_alive_tx: std::sync::mpsc::Sender<()>, 
+    // Mutex sarmalayıcıları kaldırıldı (AudioResampler internal mutability kullanır)
+    mic_resampler: AudioResampler,
+    spk_resampler: AudioResampler,
 }
 
 impl HardwareAdapter {
@@ -171,6 +173,13 @@ impl HardwareAdapter {
 
         ready_rx.recv().map_err(|e| anyhow::anyhow!("Thread communication error: {}", e))??;
 
+        let hw_sr_in = hw_sample_rate_in.load(Ordering::Relaxed) as usize;
+        let hw_sr_out = hw_sample_rate_out.load(Ordering::Relaxed) as usize;
+
+        // Doğrudan AudioResampler örneğini oluştur (Mutex olmadan)
+        let mic_resampler = AudioResampler::new(hw_sr_in, 8000, 0);
+        let spk_resampler = AudioResampler::new(8000, hw_sr_out, 0);
+
         Ok(Self {
             mic_cons: shared_mic_cons,
             spk_prod: shared_spk_prod,
@@ -178,9 +187,10 @@ impl HardwareAdapter {
             spk_gain,
             is_muted,
             is_healthy,
-            hw_sample_rate_in: hw_sample_rate_in.load(Ordering::Relaxed) as usize,
-            hw_sample_rate_out: hw_sample_rate_out.load(Ordering::Relaxed) as usize,
+            hw_sample_rate_in: hw_sr_in,
             _keep_alive_tx: keep_alive_tx,
+            mic_resampler,
+            spk_resampler,
         })
     }
 }
@@ -207,11 +217,14 @@ impl MediaAdapter for HardwareAdapter {
             mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
         }
 
-        sentiric_rtp_core::simple_resample(&mic_data, self.hw_sample_rate_in, 8000)
+        // Doğrudan process çağrısı. Resampler internal mutability kullanır.
+        self.mic_resampler.process(&mic_data)
     }
 
     fn write_spk(&self, samples_8k: &[i16]) {
-        let resampled = sentiric_rtp_core::simple_resample(samples_8k, 8000, self.hw_sample_rate_out);
+        // Doğrudan process çağrısı.
+        let resampled = self.spk_resampler.process(samples_8k);
+
         let mut prod = self.spk_prod.lock().unwrap();
         for s in resampled {
             let _ = prod.push(s as f32 / 32768.0);
