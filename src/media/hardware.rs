@@ -1,12 +1,12 @@
 // Dosya: src/media/hardware.rs
 
-use log::{error, info};
 use super::adapter::MediaAdapter;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{HeapRb, SharedRb, Producer, Consumer};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use log::{error, info};
+use ringbuf::{Consumer, HeapRb, Producer, SharedRb};
 use sentiric_rtp_core::AudioResampler;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 type RbProd = Producer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
@@ -20,7 +20,7 @@ pub struct HardwareAdapter {
     is_healthy: Arc<AtomicBool>,
     hw_sample_rate_in: usize,
     // hw_sample_rate_out kaldırıldı (Dead code engellemesi)
-    _keep_alive_tx: std::sync::mpsc::Sender<()>, 
+    _keep_alive_tx: std::sync::mpsc::Sender<()>,
     // Mutex sarmalayıcıları kaldırıldı (AudioResampler internal mutability kullanır)
     mic_resampler: AudioResampler,
     spk_resampler: AudioResampler,
@@ -63,20 +63,30 @@ impl HardwareAdapter {
             .name("cpal-keeper".into())
             .spawn(move || {
                 let host = cpal::default_host();
-                
+
                 let input_device = match host.default_input_device() {
                     Some(d) => d,
-                    None => { let _ = ready_tx.send(Err(anyhow::anyhow!("No input device"))); return; }
+                    None => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("No input device")));
+                        return;
+                    }
                 };
-                
+
                 let output_device = match host.default_output_device() {
                     Some(d) => d,
-                    None => { let _ = ready_tx.send(Err(anyhow::anyhow!("No output device"))); return; }
+                    None => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("No output device")));
+                        return;
+                    }
                 };
 
                 let mut input_config = None;
                 if let Ok(mut configs) = input_device.supported_input_configs() {
-                    if let Some(c) = configs.find(|c| c.channels() == 1 && c.min_sample_rate().0 <= 16000 && c.max_sample_rate().0 >= 16000) {
+                    if let Some(c) = configs.find(|c| {
+                        c.channels() == 1
+                            && c.min_sample_rate().0 <= 16000
+                            && c.max_sample_rate().0 >= 16000
+                    }) {
                         input_config = Some(c.with_sample_rate(cpal::SampleRate(16000)).into());
                     }
                 }
@@ -88,15 +98,23 @@ impl HardwareAdapter {
                     }
                 }
                 let input_config = input_config.unwrap_or_else(|| {
-                    input_device.default_input_config().map(|c| c.into()).unwrap_or(cpal::StreamConfig {
-                        channels: 1, sample_rate: cpal::SampleRate(16000), buffer_size: cpal::BufferSize::Default,
-                    })
+                    input_device
+                        .default_input_config()
+                        .map(|c| c.into())
+                        .unwrap_or(cpal::StreamConfig {
+                            channels: 1,
+                            sample_rate: cpal::SampleRate(16000),
+                            buffer_size: cpal::BufferSize::Default,
+                        })
                 });
 
-                let output_config = output_device.default_output_config()
+                let output_config = output_device
+                    .default_output_config()
                     .map(|c| c.into())
                     .unwrap_or_else(|_| cpal::StreamConfig {
-                        channels: 1, sample_rate: cpal::SampleRate(16000), buffer_size: cpal::BufferSize::Default,
+                        channels: 1,
+                        sample_rate: cpal::SampleRate(16000),
+                        buffer_size: cpal::BufferSize::Default,
                     });
 
                 t_sr_in.store(input_config.sample_rate.0, Ordering::Relaxed);
@@ -104,17 +122,21 @@ impl HardwareAdapter {
 
                 let in_channels = input_config.channels as usize;
                 let out_channels = output_config.channels as usize;
-                
+
                 let mut last_sample_out = 0.0f32;
 
                 let input_stream = match input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _: &_| {
-                        if t_l_muted.load(Ordering::Relaxed) { return; } 
+                        if t_l_muted.load(Ordering::Relaxed) {
+                            return;
+                        }
                         if let Ok(mut producer) = t_prod.try_lock() {
                             let gain = f32::from_bits(t_l_mic.load(Ordering::Relaxed));
                             if in_channels == 1 {
-                                for &s in data { let _ = producer.push(s * gain); }
+                                for &s in data {
+                                    let _ = producer.push(s * gain);
+                                }
                             } else {
                                 for frame in data.chunks(in_channels) {
                                     let avg = frame.iter().sum::<f32>() / in_channels as f32;
@@ -123,14 +145,17 @@ impl HardwareAdapter {
                             }
                         }
                     },
-                    move |e| { 
-                        error!("Mic Error: {}", e); 
-                        t_healthy_in.store(false, Ordering::SeqCst); 
+                    move |e| {
+                        error!("Mic Error: {}", e);
+                        t_healthy_in.store(false, Ordering::SeqCst);
                     },
-                    None
+                    None,
                 ) {
                     Ok(s) => s,
-                    Err(e) => { let _ = ready_tx.send(Err(anyhow::anyhow!("Mic build fail: {}", e))); return; }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("Mic build fail: {}", e)));
+                        return;
+                    }
                 };
 
                 let output_stream = match output_device.build_output_stream(
@@ -145,33 +170,47 @@ impl HardwareAdapter {
                                 });
                                 last_sample_out = sample;
                                 let final_sample = (sample * gain).clamp(-1.0, 1.0);
-                                for s in frame.iter_mut() { *s = final_sample; }
+                                for s in frame.iter_mut() {
+                                    *s = final_sample;
+                                }
                             }
                         } else {
-                            for s in data.iter_mut() { *s = 0.0; }
+                            for s in data.iter_mut() {
+                                *s = 0.0;
+                            }
                         }
                     },
-                    move |e| { 
-                        error!("Spk Error: {}", e); 
-                        t_healthy_out.store(false, Ordering::SeqCst); 
+                    move |e| {
+                        error!("Spk Error: {}", e);
+                        t_healthy_out.store(false, Ordering::SeqCst);
                     },
-                    None
+                    None,
                 ) {
                     Ok(s) => s,
-                    Err(e) => { let _ = ready_tx.send(Err(anyhow::anyhow!("Spk build fail: {}", e))); return; }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("Spk build fail: {}", e)));
+                        return;
+                    }
                 };
 
-                if let Err(e) = input_stream.play() { let _ = ready_tx.send(Err(anyhow::anyhow!("Mic play fail: {}", e))); return; }
-                if let Err(e) = output_stream.play() { let _ = ready_tx.send(Err(anyhow::anyhow!("Spk play fail: {}", e))); return; }
+                if let Err(e) = input_stream.play() {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("Mic play fail: {}", e)));
+                    return;
+                }
+                if let Err(e) = output_stream.play() {
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("Spk play fail: {}", e)));
+                    return;
+                }
 
                 let _ = ready_tx.send(Ok(()));
                 let _ = keep_alive_rx.recv();
 
                 info!("Hardware Adapter dropped. Audio streams closed safely.");
-           
             })?;
 
-        ready_rx.recv().map_err(|e| anyhow::anyhow!("Thread communication error: {}", e))??;
+        ready_rx
+            .recv()
+            .map_err(|e| anyhow::anyhow!("Thread communication error: {}", e))??;
 
         let hw_sr_in = hw_sample_rate_in.load(Ordering::Relaxed) as usize;
         let hw_sr_out = hw_sample_rate_out.load(Ordering::Relaxed) as usize;
@@ -201,14 +240,16 @@ impl MediaAdapter for HardwareAdapter {
         let hw_frame_size = (target_8k_samples as f32 * ratio).ceil() as usize;
 
         let mut cons = self.mic_cons.lock().unwrap();
-        
+
         if self.is_muted.load(Ordering::Relaxed) {
-            for _ in 0..cons.len() { let _ = cons.pop(); }
-            return vec![0; target_8k_samples]; 
+            for _ in 0..cons.len() {
+                let _ = cons.pop();
+            }
+            return vec![0; target_8k_samples];
         }
 
         if cons.len() < hw_frame_size {
-            return vec![]; 
+            return vec![];
         }
 
         let mut mic_data = Vec::with_capacity(hw_frame_size);

@@ -1,17 +1,17 @@
 // Dosya: sentiric-telecom-client-sdk/src/engine.rs
 
-use crate::{CallState, ClientCommand, UacEvent};
 use crate::rtp_engine::RtpEngine;
-use crate::utils::{extract_rtp_target, discover_local_ip};
 use crate::stun::StunClient;
+use crate::utils::{discover_local_ip, extract_rtp_target};
+use crate::{CallState, ClientCommand, UacEvent};
 use sentiric_sip_core::{parser, Header, HeaderName, Method, SipPacket};
+use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering; //[MİMARİ DÜZELTME]: E0433 Hatası için eklendi
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use serde_json::json; 
 
 pub mod observer_proto {
     tonic::include_proto!("sentiric.observer.v1");
@@ -53,7 +53,7 @@ impl SipEngine {
     ) -> Self {
         let (tel_tx, tel_rx) = mpsc::channel::<IngestLogRequest>(500);
         let observer_client = Arc::new(Mutex::new(None));
-        
+
         Self::spawn_telemetry_worker(tel_rx, observer_client.clone());
 
         Self {
@@ -68,8 +68,8 @@ impl SipEngine {
     }
 
     fn spawn_telemetry_worker(
-        mut rx: mpsc::Receiver<IngestLogRequest>, 
-        client_container: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>
+        mut rx: mpsc::Receiver<IngestLogRequest>,
+        client_container: Arc<Mutex<Option<ObserverServiceClient<tonic::transport::Channel>>>>,
     ) {
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
@@ -86,14 +86,27 @@ impl SipEngine {
             // [ARCH-COMPLIANCE] SUTS v4.0 (ARCH-007) - "event" metadata zorunluluğu giderildi.
             tracing::info!(event="SIP_STATE_TRANSITION", old_state=?self.state, new_state=?new_state, "🔄 SIP State Transition: {:?} -> {:?}", self.state, new_state);
             self.state = new_state.clone();
-            let _ = self.event_tx.try_send(UacEvent::CallStateChanged(new_state));
+            let _ = self
+                .event_tx
+                .try_send(UacEvent::CallStateChanged(new_state));
         }
     }
 
-    async fn send_telemetry(&self, severity: &str, event: &str, message: &str, call_id: &str, attributes: serde_json::Value) {
+    async fn send_telemetry(
+        &self,
+        severity: &str,
+        event: &str,
+        message: &str,
+        call_id: &str,
+        attributes: serde_json::Value,
+    ) {
         let os_type = std::env::consts::OS;
         let is_mobile = os_type == "android" || os_type == "ios";
-        let service_name = if is_mobile { "mobile-uac" } else { "desktop-uac" };
+        let service_name = if is_mobile {
+            "mobile-uac"
+        } else {
+            "desktop-uac"
+        };
         let host_name = format!("{}-device", os_type);
 
         let json_payload = json!({
@@ -114,40 +127,53 @@ impl SipEngine {
             "attributes": attributes
         }).to_string();
 
-        let req = IngestLogRequest { raw_json_log: json_payload };
+        let req = IngestLogRequest {
+            raw_json_log: json_payload,
+        };
         let _ = self.telemetry_tx.try_send(req);
     }
 
     pub async fn run(&mut self) {
         let local_ip = discover_local_ip();
-        let _ = self.event_tx.try_send(UacEvent::Log(format!("🔍 Discovered Local IP: {}", local_ip)));
-        
+        let _ = self.event_tx.try_send(UacEvent::Log(format!(
+            "🔍 Discovered Local IP: {}",
+            local_ip
+        )));
+
         let sip_socket = match TokioUdpSocket::bind("0.0.0.0:5060").await {
             Ok(s) => {
-                let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP bound to Port 5060".to_string()));
+                let _ = self
+                    .event_tx
+                    .try_send(UacEvent::Log("🔌 SIP bound to Port 5060".to_string()));
                 Arc::new(s)
-            },
-            Err(_) => {
-                match TokioUdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => {
-                        let _ = self.event_tx.try_send(UacEvent::Log("🔌 SIP bound to Ephemeral Port".to_string()));
-                        Arc::new(s)
-                    },
-                    Err(e) => {
-                        let _ = self.event_tx.send(UacEvent::Error(format!("SIP Bind Fail: {}", e))).await;
-                        return;
-                    }
-                }
             }
+            Err(_) => match TokioUdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => {
+                    let _ = self
+                        .event_tx
+                        .try_send(UacEvent::Log("🔌 SIP bound to Ephemeral Port".to_string()));
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    let _ = self
+                        .event_tx
+                        .send(UacEvent::Error(format!("SIP Bind Fail: {}", e)))
+                        .await;
+                    return;
+                }
+            },
         };
 
         let rtp_socket_std = match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => {
                 s.set_nonblocking(true).unwrap();
                 Arc::new(s)
-            },
+            }
             Err(e) => {
-                let _ = self.event_tx.send(UacEvent::Error(format!("RTP Bind Fail: {}", e))).await;
+                let _ = self
+                    .event_tx
+                    .send(UacEvent::Error(format!("RTP Bind Fail: {}", e)))
+                    .await;
                 return;
             }
         };
@@ -157,16 +183,23 @@ impl SipEngine {
 
         let mut public_sip_ip = local_ip.clone();
         let mut public_sip_port = sip_port;
-        
-        if let Some(stun_addr) = StunClient::discover_public_addr(&sip_socket, "stun.l.google.com:19302").await {
+
+        if let Some(stun_addr) =
+            StunClient::discover_public_addr(&sip_socket, "stun.l.google.com:19302").await
+        {
             public_sip_ip = stun_addr.ip().to_string();
             public_sip_port = stun_addr.port();
-            let _ = self.event_tx.try_send(UacEvent::Log(format!("🌍 Proactive STUN Success: NAT IP is {}:{}", public_sip_ip, public_sip_port)));
+            let _ = self.event_tx.try_send(UacEvent::Log(format!(
+                "🌍 Proactive STUN Success: NAT IP is {}:{}",
+                public_sip_ip, public_sip_port
+            )));
         } else {
-            let _ = self.event_tx.try_send(UacEvent::Log("⚠️ STUN Timeout, falling back to Local IP".to_string()));
+            let _ = self.event_tx.try_send(UacEvent::Log(
+                "⚠️ STUN Timeout, falling back to Local IP".to_string(),
+            ));
         }
 
-        let mut buf =[0u8; 4096];
+        let mut buf = [0u8; 4096];
 
         let mut current_target: Option<SocketAddr> = None;
         let mut current_call_id = String::new();
@@ -181,18 +214,22 @@ impl SipEngine {
         let mut reg_password = String::new();
 
         let mut last_invite_packet: Option<Vec<u8>> = None;
-        
+
         let mut incoming_invite_packet: Option<SipPacket> = None;
         let mut remote_addr: Option<SocketAddr> = None;
 
         let mut retransmit_interval = tokio::time::interval(Duration::from_millis(500));
         let mut stats_ticker = tokio::time::interval(Duration::from_millis(1000));
         let mut nat_keepalive_interval = tokio::time::interval(Duration::from_secs(15));
-        
+
         let mut invite_sent_time: Option<std::time::Instant> = None;
         let mut media_active_reported = false;
 
-        self.rtp_engine = Some(RtpEngine::new(rtp_socket_std.clone(), self.headless, self.event_tx.clone()));
+        self.rtp_engine = Some(RtpEngine::new(
+            rtp_socket_std.clone(),
+            self.headless,
+            self.event_tx.clone(),
+        ));
 
         loop {
             tokio::select! {
@@ -201,14 +238,14 @@ impl SipEngine {
                         ClientCommand::AcceptCall => {
                             if let (Some(invite), Some(target)) = (incoming_invite_packet.take(), remote_addr) {
                                 let _ = self.event_tx.try_send(UacEvent::Log("⬆️ Sending 200 OK (Accepting Call)".to_string()));
-                                
+
                                 if let Some(rtp_target) = extract_rtp_target(&invite.body, &target.ip().to_string()) {
                                     self.send_telemetry("INFO", "SDP_PARSED", "Media target locked", &current_call_id, json!({"target": rtp_target.to_string()})).await;
                                     if let Some(rtp) = &self.rtp_engine { rtp.start(rtp_target); }
                                 }
 
                                 let mut ok_resp = sentiric_sip_core::builder::SipResponseFactory::create_200_ok(&invite);
-                                
+
                                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                                     if !to_h.value.contains(";tag=") {
                                         current_to_tag = format!("tag-{:x}", rand::random::<u16>());
@@ -217,14 +254,14 @@ impl SipEngine {
                                 }
 
                                 let now = chrono::Utc::now().timestamp();
-                            
+
                                 // [ARCH-COMPLIANCE] PCMA Testleri için Payload type 8 olarak değiştirildi.
                                 // NOT: Bu kullanım doğru değil! Bu değerler codec yada diğer ayarlar ince bir muhendislik ile özelleştirebilmeli. ilgili kullanan servis bunu kendi ui sından yanı environment lerinden anında değiştirebilmeli.
                                 let sdp = format!(
-                                    "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
+                                    "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n",
                                     now, now, active_contact_ip, active_contact_ip, rtp_port
                                 );
-                                
+
                                 ok_resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
                                 ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                                 ok_resp.headers.push(Header::new(HeaderName::ContentLength, sdp.len().to_string()));
@@ -241,19 +278,19 @@ impl SipEngine {
                                 let mut decline = sentiric_sip_core::builder::SipResponseFactory::create_error(&invite, 603, "Decline");
                                 decline.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
                                 let _ = sip_socket.send_to(&decline.to_bytes(), target).await;
-                                
+
                                 self.change_state(if reg_user.is_empty() { CallState::Idle } else { CallState::Registered });
                             }
                         },
 
                         ClientCommand::Register { target_ip, target_port, user, password } => {
                             if self.state != CallState::Idle && self.state != CallState::AuthFailed { continue; }
-                            
+
                             let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port).parse().unwrap();
                             current_target = Some(target_addr);
                             reg_user = user.clone();
                             reg_password = password;
-                            
+
                             current_call_id = format!("reg-{:x}", rand::random::<u32>());
                             current_from_tag = format!("tag-{:x}", rand::random::<u16>());
                             current_cseq = 1;
@@ -277,7 +314,7 @@ impl SipEngine {
 
                         ClientCommand::StartCall { target_ip, target_port, to_user, from_user } => {
                             if self.state != CallState::Idle && self.state != CallState::Registered { continue; }
-                            
+
                             let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port).parse().unwrap();
                             current_target = Some(target_addr);
                             current_call_id = format!("uac-{:x}", rand::random::<u32>());
@@ -310,14 +347,14 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                             invite.headers.push(Header::new(HeaderName::CSeq, format!("{} INVITE", current_cseq)));
                             invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", from_user, active_contact_ip, active_contact_port)));
-                            
+
                             invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                             invite.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
 
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
-                                "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n", 
+                                "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n",
                                 now, now, active_contact_ip, active_contact_ip, rtp_port
                             );
                             invite.body = sdp.as_bytes().to_vec();
@@ -332,19 +369,19 @@ impl SipEngine {
                             retransmit_interval.reset();
                             self.change_state(CallState::Dialing);
                         },
-                        
+
                         ClientCommand::EndCall => {
                              last_invite_packet = None;
                              if self.state != CallState::Idle && self.state != CallState::Registered && self.state != CallState::Registering {
                                 if let Some(target) = current_target {
                                     let mut bye = SipPacket::new_request(Method::Bye, format!("sip:{}", target));
                                     let branch = sentiric_sip_core::utils::generate_branch_id();
-                                    
+
                                     bye.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
                                     bye.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                                     bye.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                                     bye.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
-                                    
+
                                     current_cseq += 1;
                                     bye.headers.push(Header::new(HeaderName::CSeq, format!("{} BYE", current_cseq)));
                                     bye.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
@@ -355,11 +392,11 @@ impl SipEngine {
                                     let _ = sip_socket.send_to(&packet_bytes, target).await;
                                 }
 
-                                if let Some(rtp) = &self.rtp_engine { 
-                                    rtp.stop(); 
+                                if let Some(rtp) = &self.rtp_engine {
+                                    rtp.stop();
                                     rtp.reset_stats(); // [MİMARİ DÜZELTME]: Sayaçları temizle
                                 }
-                                
+
                                 self.change_state(CallState::Terminated);
                                 if reg_user.is_empty() {
                                     self.change_state(CallState::Idle);
@@ -381,14 +418,14 @@ impl SipEngine {
                                 rtp.trigger_dtmf(key);
                                 let _ = self.event_tx.try_send(UacEvent::Log(format!("🎹 In-Band DTMF Injecting: {}", key)));
                             }
-                        },      
+                        },
                         ClientCommand::SetMute { muted } => {
                             if let Some(rtp) = &self.rtp_engine {
                                 rtp.set_mute(muted);
                                 let state_str = if muted { "MUTED" } else { "UNMUTED" };
                                 let _ = self.event_tx.try_send(UacEvent::Log(format!("🔇 Mic state changed: {}", state_str)));
                             }
-                        }                        
+                        }
                     }
                 },
 
@@ -400,7 +437,7 @@ impl SipEngine {
                     let _ = self.event_tx.try_send(UacEvent::Log(format!("⬇️ {}", first_line)));
 
                     if let Ok(packet) = parser::parse(&buf[..size]) {
-                         
+
                          if packet.is_request() {
 
                              if packet.method == Method::Invite {
@@ -413,13 +450,13 @@ impl SipEngine {
 
                                  let from_val = packet.get_header_value(HeaderName::From).cloned().unwrap_or_default();
                                  let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-                                 
+
                                  tracing::info!(event="INBOUND_INVITE_RECEIVED", sip.call_id=%call_id, "🔔 Gelen arama tespit edildi: {}", from_val);
-                                 
+
                                  incoming_invite_packet = Some(packet.clone());
                                  remote_addr = Some(src);
                                  current_call_id = call_id.clone();
-                                 current_target = Some(src); 
+                                 current_target = Some(src);
 
                                  let mut ringing = sentiric_sip_core::builder::SipResponseFactory::create_180_ringing(&packet);
                                  if let Some(to_h) = ringing.headers.iter_mut().find(|h| h.name == HeaderName::To) {
@@ -434,27 +471,27 @@ impl SipEngine {
                                  self.change_state(CallState::Incoming);
                                  let _ = self.event_tx.try_send(UacEvent::IncomingCall { from: from_val.clone(), call_id: call_id.clone() });
                                  self.send_telemetry("INFO", "SIP_INBOUND_INVITE", "Incoming call received", &call_id, json!({"from": from_val})).await;
-                                 
+
                                  continue;
                              }
 
                              if packet.method == Method::Bye {
                                  let _ = self.event_tx.try_send(UacEvent::Log("🏁 Server closed connection (BYE).".to_string()));
                                  self.send_telemetry("INFO", "REMOTE_HANGUP", "Received BYE from Server", &current_call_id, json!({})).await;
-                                 
+
                                  let mut ok_resp = sentiric_sip_core::builder::SipResponseFactory::create_200_ok(&packet);
                                  ok_resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
                                  ok_resp.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                                  ok_resp.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
-                                 
+
                                  let _ = sip_socket.send_to(&ok_resp.to_bytes(), src).await;
                                  let _ = self.event_tx.try_send(UacEvent::Log("⬆️ 200 OK (For BYE) sent".to_string()));
 
-                                 if let Some(rtp) = &self.rtp_engine { 
-                                     rtp.stop(); 
+                                 if let Some(rtp) = &self.rtp_engine {
+                                     rtp.stop();
                                      rtp.reset_stats(); // [MİMARİ DÜZELTME]: Sayaçları temizle
                                  }
-                                 
+
                                  self.change_state(CallState::Terminated);
                                  if reg_user.is_empty() {
                                      self.change_state(CallState::Idle);
@@ -464,11 +501,11 @@ impl SipEngine {
                                  media_active_reported = false;
                                  last_invite_packet = None;
                              }
-                             continue; 
+                             continue;
                          }
 
                          let status_code = packet.status_code;
-                         
+
                         // [ARCH-COMPLIANCE] Satır ~400: Gelen HTTP 1xx (Provisional) yanıtlarındaki hata düzeltildi.
                         if status_code >= 100 && (self.state == CallState::Dialing || self.state == CallState::Registering) {
                             if status_code < 200 {
@@ -490,10 +527,10 @@ impl SipEngine {
                              if let Some(www_auth) = packet.get_header_value(HeaderName::Other("WWW-Authenticate".to_string())) {
                                  let target = current_target.unwrap();
                                  let method_str = if self.state == CallState::Registering { "REGISTER" } else { "INVITE" };
-                                 
+
                                  if let Some(auth_header) = crate::auth::generate_auth_header(&reg_user, &reg_password, method_str, &format!("sip:{}", target.ip()), www_auth) {
                                      current_cseq += 1;
-                                     
+
                                      let method = if self.state == CallState::Registering { Method::Register } else { Method::Invite };
                                      let mut auth_req = SipPacket::new_request(method, format!("sip:{}", target.ip()));
                                      let branch = sentiric_sip_core::utils::generate_branch_id();
@@ -504,11 +541,11 @@ impl SipEngine {
                                      auth_req.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                                      auth_req.headers.push(Header::new(HeaderName::CSeq, format!("{} {}", current_cseq, method_str)));
                                      auth_req.headers.push(Header::new(HeaderName::Contact, format!("<sip:{}@{}:{}>", reg_user, active_contact_ip, active_contact_port)));
-                                     
+
                                      if self.state == CallState::Registering {
                                          auth_req.headers.push(Header::new(HeaderName::Other("Expires".to_string()), "3600".to_string()));
                                      }
-                                     
+
                                      auth_req.headers.push(Header::new(HeaderName::Other("Authorization".to_string()), auth_header));
                                      auth_req.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
 
@@ -524,28 +561,28 @@ impl SipEngine {
                              self.change_state(CallState::Registered);
                              let _ = self.event_tx.try_send(UacEvent::Log("✅ Registered successfully to network!".to_string()));
                          }
-                         
+
                          if status_code == 180 || status_code == 183 {
                              self.change_state(CallState::Ringing);
-                         } 
-                         
+                         }
+
                          if status_code == 200 && (self.state == CallState::Dialing || self.state == CallState::Ringing) {
-                            last_invite_packet = None; 
+                            last_invite_packet = None;
                             invite_sent_time = None; // <--- EKLENDİ: Başarılı bağlantıda sayaç durdurulur.
-                           
+
                             if let Some(to) = packet.get_header_value(HeaderName::To) { current_to_tag = to.clone(); }
-                             
+
                              if let Some(rtp_target) = extract_rtp_target(&packet.body, &src.ip().to_string()) {
                                  self.send_telemetry("INFO", "SDP_PARSED", "Media target locked", &current_call_id, json!({"target": rtp_target.to_string()})).await;
                                  if let Some(rtp) = &self.rtp_engine { rtp.start(rtp_target); }
                              }
-                             
+
                              let mut ack = SipPacket::new_request(Method::Ack, format!("sip:{}", src));
                              let branch = sentiric_sip_core::utils::generate_branch_id();
 
                              ack.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
-                             if let Some(from) = packet.get_header_value(HeaderName::From) { 
-                                 ack.headers.push(Header::new(HeaderName::From, from.clone())); 
+                             if let Some(from) = packet.get_header_value(HeaderName::From) {
+                                 ack.headers.push(Header::new(HeaderName::From, from.clone()));
                              }
                              ack.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                              ack.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
@@ -553,7 +590,7 @@ impl SipEngine {
                              ack.headers.push(Header::new(HeaderName::Contact, format!("<sip:mobile@{}:{}>", active_contact_ip, active_contact_port)));
                              ack.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                              ack.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
-                             
+
                              if let Some(target) = current_target {
                                  let ack_bytes = ack.to_bytes();
                                  let _ = self.event_tx.try_send(UacEvent::Log("⬆️ ACK sent".to_string()));
@@ -579,7 +616,7 @@ impl SipEngine {
                     if let Some(start_time) = invite_sent_time {
                         if start_time.elapsed() > Duration::from_secs(45) { // 15'ten 45'e çıkarıldı
                             let _ = self.event_tx.try_send(UacEvent::Log("⏱️ Ringing Timeout (No Answer)!".to_string()));
-                            
+
                             // [CRITICAL FIX]: Timeout olduğunda ağa CANCEL göndererek karşı tarafın çalmasını durdur!
                             if (self.state == CallState::Dialing || self.state == CallState::Ringing) && current_target.is_some() {
                                 if let Some(target) = current_target {
@@ -589,14 +626,14 @@ impl SipEngine {
                                         .and_then(|p| p.get_header_value(HeaderName::Via).cloned())
                                         .and_then(|v| v.split("branch=").nth(1).map(|s| s.split(';').next().unwrap_or("").to_string()))
                                         .unwrap_or_else(|| sentiric_sip_core::utils::generate_branch_id());
-                                    
+
                                     cancel.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
                                     cancel.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));
                                     cancel.headers.push(Header::new(HeaderName::To, current_to_tag.clone()));
                                     cancel.headers.push(Header::new(HeaderName::CallId, current_call_id.clone()));
                                     cancel.headers.push(Header::new(HeaderName::CSeq, format!("{} CANCEL", current_cseq)));
                                     cancel.headers.push(Header::new(HeaderName::ContentLength, "0".to_string()));
-                                    
+
                                     let _ = sip_socket.send_to(&cancel.to_bytes(), target).await;
                                     let _ = self.event_tx.try_send(UacEvent::Log("⬆️ CANCEL sent due to timeout".to_string()));
                                 }
@@ -614,7 +651,7 @@ impl SipEngine {
                                 rtp.stop();
                                 rtp.reset_stats();
                             }
-                            continue; 
+                            continue;
                         }
                     }
 

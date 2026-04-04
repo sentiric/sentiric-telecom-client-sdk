@@ -20,7 +20,7 @@ impl MediaAdapter for HeadlessAdapter {
             vec![0; target_8k_samples] // Sessizlik
         } else {
             // Sunucu testleri için VAD'ı tetikleyecek sahte sinyal (Pseudo-noise)
-            vec![1000; target_8k_samples] 
+            vec![1000; target_8k_samples]
         }
     }
 

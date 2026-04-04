@@ -1,11 +1,11 @@
 // Dosya: sentiric-telecom-client-sdk/src/lib.rs
 
-pub mod engine;
-pub mod rtp_engine;
-pub mod utils;
-pub mod stun;
-pub mod media;
 pub mod auth;
+pub mod engine;
+pub mod media;
+pub mod rtp_engine;
+pub mod stun;
+pub mod utils;
 
 use tokio::sync::mpsc;
 
@@ -72,7 +72,7 @@ pub struct TelecomClient {
 impl TelecomClient {
     pub fn new(event_tx: mpsc::Sender<UacEvent>, headless: bool) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
-        
+
         tokio::spawn(async move {
             let mut engine = engine::SipEngine::new(event_tx, cmd_rx, headless).await;
             engine.run().await;
@@ -81,15 +81,39 @@ impl TelecomClient {
         Self { command_tx: cmd_tx }
     }
 
-    pub async fn register(&self, target_ip: String, target_port: u16, user: String, password: String) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::Register { target_ip, target_port, user, password })
+    pub async fn register(
+        &self,
+        target_ip: String,
+        target_port: u16,
+        user: String,
+        password: String,
+    ) -> anyhow::Result<()> {
+        self.command_tx
+            .send(ClientCommand::Register {
+                target_ip,
+                target_port,
+                user,
+                password,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 
-    pub async fn start_call(&self, target_ip: String, target_port: u16, to_user: String, from_user: String) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::StartCall { target_ip, target_port, to_user, from_user })
+    pub async fn start_call(
+        &self,
+        target_ip: String,
+        target_port: u16,
+        to_user: String,
+        from_user: String,
+    ) -> anyhow::Result<()> {
+        self.command_tx
+            .send(ClientCommand::StartCall {
+                target_ip,
+                target_port,
+                to_user,
+                from_user,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
@@ -97,7 +121,8 @@ impl TelecomClient {
 
     // [YENİ]: Cevapla
     pub async fn accept_call(&self) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::AcceptCall)
+        self.command_tx
+            .send(ClientCommand::AcceptCall)
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
@@ -105,28 +130,32 @@ impl TelecomClient {
 
     // [YENİ]: Reddet
     pub async fn reject_call(&self) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::RejectCall)
+        self.command_tx
+            .send(ClientCommand::RejectCall)
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 
     pub async fn end_call(&self) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::EndCall)
+        self.command_tx
+            .send(ClientCommand::EndCall)
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
-    
+
     pub async fn set_mute(&self, muted: bool) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::SetMute { muted })
+        self.command_tx
+            .send(ClientCommand::SetMute { muted })
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())
     }
 
     pub async fn send_dtmf(&self, key: char) -> anyhow::Result<()> {
-        self.command_tx.send(ClientCommand::SendDtmf { key })
+        self.command_tx
+            .send(ClientCommand::SendDtmf { key })
             .await
             .map_err(|_| anyhow::anyhow!("Engine task is unreachable"))?;
         Ok(())

@@ -33,7 +33,7 @@ pub fn extract_rtp_target(sdp_body: &[u8], default_ip: &str) -> Option<SocketAdd
 /// [NEW ADIM 3]: Cihazın o anki aktif ağ arayüzü IP'sini keşfeder.
 /// 0.0.0.0 kullanımını bitiren zeki mekanizma.
 pub fn discover_local_ip() -> String {
-    // Rastgele bir dış adrese "bağlanıyormuş" gibi yapıyoruz. 
+    // Rastgele bir dış adrese "bağlanıyormuş" gibi yapıyoruz.
     // Bu işlem internet gerektirmez, sadece OS yönlendirme tablosuna bakar.
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,

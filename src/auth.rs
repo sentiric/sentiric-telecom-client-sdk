@@ -10,7 +10,9 @@ pub fn generate_auth_header(
     www_authenticate: &str,
 ) -> Option<String> {
     let header_clean = www_authenticate.trim();
-    if !header_clean.to_lowercase().starts_with("digest ") { return None; }
+    if !header_clean.to_lowercase().starts_with("digest ") {
+        return None;
+    }
 
     let mut map = HashMap::new();
     let parts = header_clean[7..].split(',');

@@ -1,14 +1,14 @@
 // Dosya: sentiric-telecom-client-sdk/src/rtp_engine.rs
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicU8, Ordering};
-use tokio::sync::mpsc;
 use std::panic;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
-use sentiric_rtp_core::{CodecFactory, CodecType, Pacer, RtpHeader, RtpPacket};
+use crate::media::{HardwareAdapter, HeadlessAdapter, MediaAdapter};
 use crate::UacEvent;
-use crate::media::{MediaAdapter, HardwareAdapter, HeadlessAdapter};
+use sentiric_rtp_core::{CodecFactory, CodecType, Pacer, RtpHeader, RtpPacket};
 
 pub struct RtpEngine {
     socket: Arc<UdpSocket>,
@@ -19,7 +19,7 @@ pub struct RtpEngine {
     event_tx: mpsc::Sender<UacEvent>,
     mic_gain: Arc<AtomicU32>,
     speaker_gain: Arc<AtomicU32>,
-    dtmf_queue: Arc<AtomicU8>, 
+    dtmf_queue: Arc<AtomicU8>,
     is_muted: Arc<AtomicBool>,
 }
 
@@ -62,15 +62,17 @@ impl RtpEngine {
     }
 
     pub fn start(&self, target: SocketAddr) {
-        if self.is_running.swap(true, Ordering::SeqCst) { return; }
-        
+        if self.is_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         let is_running = self.is_running.clone();
         let socket = self.socket.clone();
         let rx_cnt = self.rx_count.clone();
         let tx_cnt = self.tx_count.clone();
         let headless = self.headless_mode;
         let ui_tx = self.event_tx.clone();
-        
+
         let live_mic = self.mic_gain.clone();
         let live_spk = self.speaker_gain.clone();
         let dtmf_queue = self.dtmf_queue.clone();
@@ -81,27 +83,42 @@ impl RtpEngine {
             .spawn(move || {
                 let is_running_inner = is_running.clone();
                 let ui_tx_inner = ui_tx.clone();
-                
+
                 let result = panic::catch_unwind(move || {
                     let _ = run_media_loop(
-                        is_running_inner.clone(), socket, target, rx_cnt, tx_cnt, 
-                        live_mic, live_spk, dtmf_queue, is_muted, headless, ui_tx_inner
+                        is_running_inner.clone(),
+                        socket,
+                        target,
+                        rx_cnt,
+                        tx_cnt,
+                        live_mic,
+                        live_spk,
+                        dtmf_queue,
+                        is_muted,
+                        headless,
+                        ui_tx_inner,
                     );
                 });
-                
+
                 if let Err(err) = result {
-                    let msg = if let Some(s) = err.downcast_ref::<&str>() { s.to_string() } else { "Unknown panic".to_string() };
-                    let _ = ui_tx.blocking_send(UacEvent::Error(format!("☠️ RTP Panicked: {}", msg)));
+                    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    let _ =
+                        ui_tx.blocking_send(UacEvent::Error(format!("☠️ RTP Panicked: {}", msg)));
                     is_running.store(false, Ordering::SeqCst);
                 }
-            }).unwrap();
+            })
+            .unwrap();
     }
 
     pub fn stop(&self) {
         self.is_running.store(false, Ordering::SeqCst);
     }
 
-    ///[YENİ]: Çağrı sonlandığında sayaçları sıfırlar. 
+    ///[YENİ]: Çağrı sonlandığında sayaçları sıfırlar.
     pub fn reset_stats(&self) {
         self.rx_count.store(0, Ordering::Relaxed);
         self.tx_count.store(0, Ordering::Relaxed);
@@ -110,26 +127,34 @@ impl RtpEngine {
 
 // TEMİZ AĞ DÖNGÜSÜ (PURE NETWORK LOOP)
 fn run_media_loop(
-    is_running: Arc<AtomicBool>, socket: Arc<UdpSocket>, target: SocketAddr,
-    rx_cnt: Arc<AtomicU64>, tx_cnt: Arc<AtomicU64>,
-    live_mic_gain: Arc<AtomicU32>, live_speaker_gain: Arc<AtomicU32>,
-    dtmf_queue: Arc<AtomicU8>, is_muted: Arc<AtomicBool>, headless: bool,
-    ui_tx: mpsc::Sender<UacEvent>
+    is_running: Arc<AtomicBool>,
+    socket: Arc<UdpSocket>,
+    target: SocketAddr,
+    rx_cnt: Arc<AtomicU64>,
+    tx_cnt: Arc<AtomicU64>,
+    live_mic_gain: Arc<AtomicU32>,
+    live_speaker_gain: Arc<AtomicU32>,
+    dtmf_queue: Arc<AtomicU8>,
+    is_muted: Arc<AtomicBool>,
+    headless: bool,
+    ui_tx: mpsc::Sender<UacEvent>,
 ) -> anyhow::Result<()> {
-    
     // [SELF-HEALING OUTER LOOP]: Adaptör çökerse (Rota Değişirse) buradan yeniden kurulur.
     while is_running.load(Ordering::SeqCst) {
-        
         // 1. ADAPTÖRÜ SEÇ VE BAŞLAT
         let adapter: Box<dyn MediaAdapter> = if headless {
-            let _ = ui_tx.blocking_send(UacEvent::Log("👻 Booting Virtual DSP (Headless Mode)".into()));
+            let _ = ui_tx.blocking_send(UacEvent::Log(
+                "👻 Booting Virtual DSP (Headless Mode)".into(),
+            ));
             Box::new(HeadlessAdapter::new())
         } else {
-            let _ = ui_tx.blocking_send(UacEvent::Log("🎤 Booting Hardware Audio Engine...".into()));
+            let _ =
+                ui_tx.blocking_send(UacEvent::Log("🎤 Booting Hardware Audio Engine...".into()));
             match HardwareAdapter::new() {
                 Ok(a) => Box::new(a),
                 Err(e) => {
-                    let _ = ui_tx.blocking_send(UacEvent::Log(format!("⚠️ Hardware Init Fail: {}", e)));
+                    let _ =
+                        ui_tx.blocking_send(UacEvent::Log(format!("⚠️ Hardware Init Fail: {}", e)));
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
@@ -141,13 +166,13 @@ fn run_media_loop(
         let mut encoder = CodecFactory::create_encoder(codec_type);
         let mut decoder = CodecFactory::create_decoder(codec_type);
         let mut pacer = Pacer::new(20);
-        
+
         let mut seq: u16 = rand::random();
         let mut ts: u32 = rand::random();
         let ssrc: u32 = rand::random();
         let mut recv_buf = [0u8; 1500];
 
-        pacer.reset(); 
+        pacer.reset();
 
         // [STRICT INNER LOOP] Sadece 20ms'lik Ağ İşlemleri
         while is_running.load(Ordering::SeqCst) && adapter.is_healthy() {
@@ -165,16 +190,26 @@ fn run_media_loop(
                 let mut dtmf_duration: u16 = 160;
                 for i in 0..5 {
                     let end_bit = if i == 4 { 0x80 } else { 0x00 };
-                    let payload = vec![dtmf_event, end_bit | 10, (dtmf_duration >> 8) as u8, dtmf_duration as u8];
-                    let packet = RtpPacket { header: RtpHeader::new(101, seq, ts, ssrc), payload };
+                    let payload = vec![
+                        dtmf_event,
+                        end_bit | 10,
+                        (dtmf_duration >> 8) as u8,
+                        dtmf_duration as u8,
+                    ];
+                    let packet = RtpPacket {
+                        header: RtpHeader::new(101, seq, ts, ssrc),
+                        payload,
+                    };
                     let _ = socket.send_to(&packet.to_bytes(), target);
-                    
-                    if i < 4 { dtmf_duration += 160; }
+
+                    if i < 4 {
+                        dtmf_duration += 160;
+                    }
                     seq = seq.wrapping_add(1);
-                    std::thread::sleep(std::time::Duration::from_millis(20)); 
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 ts = ts.wrapping_add(dtmf_duration as u32);
-                continue; 
+                continue;
             }
 
             // C. RX (Ağdan Oku -> Hoparlöre Yaz)
@@ -182,7 +217,8 @@ fn run_media_loop(
                 if len > 12 {
                     rx_cnt.fetch_add(1, Ordering::Relaxed);
                     let payload_type = recv_buf[1] & 0x7F;
-                    if payload_type != 101 { // DTMF değilse ses verisidir
+                    if payload_type != 101 {
+                        // DTMF değilse ses verisidir
                         let samples_8k = decoder.decode(&recv_buf[12..len]);
                         adapter.write_spk(&samples_8k);
                     }
@@ -194,7 +230,10 @@ fn run_media_loop(
             if mic_data.len() == 160 {
                 let payload = encoder.encode(&mic_data);
                 if !payload.is_empty() {
-                    let packet = RtpPacket { header: RtpHeader::new(0, seq, ts, ssrc), payload };
+                    let packet = RtpPacket {
+                        header: RtpHeader::new(0, seq, ts, ssrc),
+                        payload,
+                    };
                     if socket.send_to(&packet.to_bytes(), target).is_ok() {
                         tx_cnt.fetch_add(1, Ordering::Relaxed);
                     }
@@ -205,7 +244,9 @@ fn run_media_loop(
         } // İç Döngü Bitişi
 
         if is_running.load(Ordering::SeqCst) {
-            let _ = ui_tx.blocking_send(UacEvent::Log("🔄 Route Change Detected! Rebuilding streams...".into()));
+            let _ = ui_tx.blocking_send(UacEvent::Log(
+                "🔄 Route Change Detected! Rebuilding streams...".into(),
+            ));
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
