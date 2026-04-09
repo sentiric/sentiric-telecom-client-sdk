@@ -8,12 +8,10 @@ use sentiric_rtp_core::AudioResampler;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-// [ARCH-COMPLIANCE] Mutex sarmalı kalktığı için type tanımlamaları sadeleşti
 type RbProd = Producer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 
 pub struct HardwareAdapter {
-    // Network thread'inin kullandığı uçlar (Sadece network thread'i erişeceği için basit Mutex yeterlidir)
     mic_cons: Mutex<RbCons>,
     spk_prod: Mutex<RbProd>,
 
@@ -30,12 +28,11 @@ pub struct HardwareAdapter {
 
 impl HardwareAdapter {
     pub fn new() -> anyhow::Result<Self> {
-        // [CRITICAL FIX]: Lock-Free (SPSC) mimariye geçiş.
-        let rb_in = HeapRb::<f32>::new(48000);
-        let (mut mic_prod, mic_cons) = rb_in.split(); // mic_prod Cpal'e, mic_cons Engine'e
+        let rb_in = HeapRb::<f32>::new(96000); // Bufferları 44.1k / 48k için büyüttük
+        let (mut mic_prod, mic_cons) = rb_in.split();
 
-        let rb_out = HeapRb::<f32>::new(48000);
-        let (spk_prod, mut spk_cons) = rb_out.split(); // spk_prod Engine'e, spk_cons Cpal'e
+        let rb_out = HeapRb::<f32>::new(96000);
+        let (spk_prod, mut spk_cons) = rb_out.split();
 
         let is_muted = Arc::new(AtomicBool::new(false));
         let is_healthy = Arc::new(AtomicBool::new(true));
@@ -77,18 +74,12 @@ impl HardwareAdapter {
                     }
                 };
 
-                // ---------------------------------------------------------
-                // [CRITICAL FIX]: ANDROID OBOE/AUDIORECORD CRASH PREVENTION
-                // Cihazın desteklediği config'leri taramak (supported_input_configs)
-                // Android'de AudioRecord çökmesine neden olur.
-                // Bu yüzden taramayı (probe) SİLİYORUZ.
-                // Cihazın donanımı (örn: 48kHz Stereo) ne ise onu itiraz etmeden kabul ediyoruz.
-                // ---------------------------------------------------------
-
+                // [CRITICAL FIX]: Android'in AudioRecord hatalarını önlemek için supported_configs()
+                // taramasını atlayıp doğrudan cihazın "native" konfigürasyonunu istiyoruz.
                 let input_config: cpal::StreamConfig = input_device
                     .default_input_config()
                     .map(|c| c.into())
-                    .unwrap_or_else(|_| cpal::StreamConfig {
+                    .unwrap_or(cpal::StreamConfig {
                         channels: 1,
                         sample_rate: cpal::SampleRate(16000),
                         buffer_size: cpal::BufferSize::Default,
@@ -97,23 +88,23 @@ impl HardwareAdapter {
                 let output_config: cpal::StreamConfig = output_device
                     .default_output_config()
                     .map(|c| c.into())
-                    .unwrap_or_else(|_| cpal::StreamConfig {
+                    .unwrap_or(cpal::StreamConfig {
                         channels: 1,
                         sample_rate: cpal::SampleRate(16000),
                         buffer_size: cpal::BufferSize::Default,
                     });
 
-                // ---------------------------------------------------------
+                let hw_sr_in_val = input_config.sample_rate.0;
+                let hw_sr_out_val = output_config.sample_rate.0;
 
-                t_sr_in.store(input_config.sample_rate.0, Ordering::Relaxed);
-                t_sr_out.store(output_config.sample_rate.0, Ordering::Relaxed);
+                t_sr_in.store(hw_sr_in_val, Ordering::Relaxed);
+                t_sr_out.store(hw_sr_out_val, Ordering::Relaxed);
 
                 let in_channels = input_config.channels as usize;
                 let out_channels = output_config.channels as usize;
 
                 let mut last_sample_out = 0.0f32;
 
-                // [CRITICAL FIX]: LOCK-FREE MIC READ (Cpal Thread)
                 let input_stream = match input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _: &_| {
@@ -127,6 +118,7 @@ impl HardwareAdapter {
                                 let _ = mic_prod.push(s * gain);
                             }
                         } else {
+                            // Cihaz stereo ise (Android 44.1k Stereo), kanalları birleştirerek Mono yapıyoruz
                             for frame in data.chunks(in_channels) {
                                 let avg = frame.iter().sum::<f32>() / in_channels as f32;
                                 let _ = mic_prod.push(avg * gain);
@@ -148,16 +140,18 @@ impl HardwareAdapter {
 
                 let mut is_buffering = true;
 
-                // [CRITICAL FIX]: LOCK-FREE SPK WRITE + CLIENT-SIDE PRE-BUFFERING (Cpal Thread)
+                // [CRITICAL FIX]: Sabit 3200 sample yerine, OS'in Frekansına göre DİNAMİK Jitter Buffer hesabı.
+                // 250ms'lik bir Pre-Buffer ayarlıyoruz (Ağdaki Jitter'ı tamamen emer).
+                // Eğer cihaz 44100 Hz ise: 44100 * 0.25 = 11025 sample bekleyecek.
+                let target_prebuffer_size = (hw_sr_out_val as f32 * 0.25) as usize;
+
                 let output_stream = match output_device.build_output_stream(
                     &output_config,
                     move |data: &mut [f32], _: &_| {
                         let gain = f32::from_bits(t_l_spk.load(Ordering::Relaxed));
 
-                        // Phase-Alignment: 200ms Jitter Buffer dolana kadar sessizlik bas
                         if is_buffering {
-                            if spk_cons.len() >= 3200 {
-                                // ~200ms at 16kHz
+                            if spk_cons.len() >= target_prebuffer_size {
                                 is_buffering = false;
                             } else {
                                 for s in data.iter_mut() {
@@ -169,8 +163,8 @@ impl HardwareAdapter {
 
                         for frame in data.chunks_mut(out_channels) {
                             let sample = spk_cons.pop().unwrap_or_else(|| {
-                                is_buffering = true; // Starvation! Yeniden buffer doldur
-                                last_sample_out *= 0.8; // Crackling engellemek için sinyali yumuşat
+                                is_buffering = true; // Starvation! Yeniden dinamik buffer dolmasını bekle
+                                last_sample_out *= 0.8; // Crackling engellemek için sinyali anında kesme, sönümle (Fade Out)
                                 last_sample_out
                             });
                             last_sample_out = sample;
@@ -238,7 +232,7 @@ impl MediaAdapter for HardwareAdapter {
         let ratio = self.hw_sample_rate_in as f32 / 8000.0;
         let hw_frame_size = (target_8k_samples as f32 * ratio).ceil() as usize;
 
-        let mut cons = self.mic_cons.lock().unwrap(); // Sadece Network Thread tarafından kitlenir (Safe)
+        let mut cons = self.mic_cons.lock().unwrap();
 
         if self.is_muted.load(Ordering::Relaxed) {
             for _ in 0..cons.len() {
@@ -247,10 +241,9 @@ impl MediaAdapter for HardwareAdapter {
             return vec![0; target_8k_samples];
         }
 
-        // [CRITICAL FIX]: Toleranslı Mic Okuma (Ses kesintisini engeller)
         let available = cons.len();
         if available < (hw_frame_size / 2) {
-            return vec![]; // Çok az veri var, bekle.
+            return vec![];
         }
 
         let read_size = std::cmp::min(hw_frame_size, available);
@@ -260,7 +253,6 @@ impl MediaAdapter for HardwareAdapter {
             mic_data.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
         }
 
-        // Drop the lock before heavy DSP processing
         drop(cons);
         self.mic_resampler.process(&mic_data)
     }
@@ -268,7 +260,7 @@ impl MediaAdapter for HardwareAdapter {
     fn write_spk(&self, samples_8k: &[i16]) {
         let resampled = self.spk_resampler.process(samples_8k);
 
-        let mut prod = self.spk_prod.lock().unwrap(); // Sadece Network Thread tarafından kitlenir (Safe)
+        let mut prod = self.spk_prod.lock().unwrap();
         for s in resampled {
             let _ = prod.push(s as f32 / 32768.0);
         }
