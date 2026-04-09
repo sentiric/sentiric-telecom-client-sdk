@@ -77,35 +77,24 @@ impl HardwareAdapter {
                     }
                 };
 
-                let mut input_config = None;
-                if let Ok(mut configs) = input_device.supported_input_configs() {
-                    if let Some(c) = configs.find(|c| {
-                        c.channels() == 1
-                            && c.min_sample_rate().0 <= 16000
-                            && c.max_sample_rate().0 >= 16000
-                    }) {
-                        input_config = Some(c.with_sample_rate(cpal::SampleRate(16000)).into());
-                    }
-                }
-                if input_config.is_none() {
-                    if let Ok(mut configs) = input_device.supported_input_configs() {
-                        if let Some(c) = configs.find(|c| c.channels() == 1) {
-                            input_config = Some(c.with_max_sample_rate().into());
-                        }
-                    }
-                }
-                let input_config = input_config.unwrap_or_else(|| {
-                    input_device
-                        .default_input_config()
-                        .map(|c| c.into())
-                        .unwrap_or(cpal::StreamConfig {
-                            channels: 1,
-                            sample_rate: cpal::SampleRate(16000),
-                            buffer_size: cpal::BufferSize::Default,
-                        })
-                });
+                // ---------------------------------------------------------
+                // [CRITICAL FIX]: ANDROID OBOE/AUDIORECORD CRASH PREVENTION
+                // Cihazın desteklediği config'leri taramak (supported_input_configs)
+                // Android'de AudioRecord çökmesine neden olur.
+                // Bu yüzden taramayı (probe) SİLİYORUZ.
+                // Cihazın donanımı (örn: 48kHz Stereo) ne ise onu itiraz etmeden kabul ediyoruz.
+                // ---------------------------------------------------------
 
-                let output_config = output_device
+                let input_config: cpal::StreamConfig = input_device
+                    .default_input_config()
+                    .map(|c| c.into())
+                    .unwrap_or_else(|_| cpal::StreamConfig {
+                        channels: 1,
+                        sample_rate: cpal::SampleRate(16000),
+                        buffer_size: cpal::BufferSize::Default,
+                    });
+
+                let output_config: cpal::StreamConfig = output_device
                     .default_output_config()
                     .map(|c| c.into())
                     .unwrap_or_else(|_| cpal::StreamConfig {
@@ -113,6 +102,8 @@ impl HardwareAdapter {
                         sample_rate: cpal::SampleRate(16000),
                         buffer_size: cpal::BufferSize::Default,
                     });
+
+                // ---------------------------------------------------------
 
                 t_sr_in.store(input_config.sample_rate.0, Ordering::Relaxed);
                 t_sr_out.store(output_config.sample_rate.0, Ordering::Relaxed);
