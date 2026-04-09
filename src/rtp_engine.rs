@@ -163,7 +163,6 @@ fn run_media_loop(
         };
 
         // 2. NETWORK ENGINE SETUP
-        // [ARCH-COMPLIANCE FIX]: Hardcoded PCMU kaldırıldı. Çevre değişkeninden veya varsayılan PCMA olarak okur.
         let pref_codec =
             std::env::var("PREFERRED_AUDIO_CODEC").unwrap_or_else(|_| "PCMA".to_string());
         let codec_type = if pref_codec == "PCMU" {
@@ -172,8 +171,12 @@ fn run_media_loop(
             CodecType::PCMA
         };
 
+        // [ARCH-COMPLIANCE FIX]: Payload Type etiketini dinamik seç
+        let payload_type_id: u8 = if codec_type == CodecType::PCMU { 0 } else { 8 };
+
         let mut encoder = CodecFactory::create_encoder(codec_type);
         let mut decoder = CodecFactory::create_decoder(codec_type);
+
         let mut pacer = Pacer::new(20);
 
         let mut seq: u16 = rand::random();
@@ -240,7 +243,8 @@ fn run_media_loop(
                 let payload = encoder.encode(&mic_data);
                 if !payload.is_empty() {
                     let packet = RtpPacket {
-                        header: RtpHeader::new(0, seq, ts, ssrc),
+                        // [CRITICAL FIX]: Hardcoded 0 yerine dinamik payload_type_id kullanılıyor
+                        header: RtpHeader::new(payload_type_id, seq, ts, ssrc),
                         payload,
                     };
                     if socket.send_to(&packet.to_bytes(), target).is_ok() {
