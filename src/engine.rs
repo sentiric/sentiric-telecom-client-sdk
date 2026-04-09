@@ -29,15 +29,17 @@ pub struct SipEngine {
     headless: bool,
 }
 
+// 1. extract_public_addr_from_via fonksiyonunu değiştirin (Satır ~32 civarı)
 fn extract_public_addr_from_via(via: &str, fallback_ip: &str, fallback_port: u16) -> (String, u16) {
     let mut ip = fallback_ip.to_string();
     let mut port = fallback_port;
     for param in via.split(';') {
         let p_trim = param.trim();
-        if p_trim.starts_with("received=") {
-            ip = p_trim[9..].to_string();
-        } else if p_trim.starts_with("rport=") {
-            if let Ok(p) = p_trim[6..].parse::<u16>() {
+        // [CLIPPY FIX]: manual_strip
+        if let Some(stripped) = p_trim.strip_prefix("received=") {
+            ip = stripped.to_string();
+        } else if let Some(stripped) = p_trim.strip_prefix("rport=") {
+            if let Ok(p) = stripped.parse::<u16>() {
                 port = p;
             }
         }
@@ -352,9 +354,10 @@ impl SipEngine {
                             invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric-Mobile-UAC/4.0".to_string()));
                             invite.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
 
+                            // [ARCH-COMPLIANCE FIX]: PCMU (0) yerine PCMA (8) zorlandı.
                             let now = chrono::Utc::now().timestamp();
                             let sdp = format!(
-                                "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n",
+                                "v=0\r\no=- {} {} IN IP4 {}\r\ns=Sentiric Session\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=ptime:20\r\n",
                                 now, now, active_contact_ip, active_contact_ip, rtp_port
                             );
                             invite.body = sdp.as_bytes().to_vec();
@@ -620,12 +623,15 @@ impl SipEngine {
                             // [CRITICAL FIX]: Timeout olduğunda ağa CANCEL göndererek karşı tarafın çalmasını durdur!
                             if (self.state == CallState::Dialing || self.state == CallState::Ringing) && current_target.is_some() {
                                 if let Some(target) = current_target {
+
                                     let mut cancel = SipPacket::new_request(Method::Cancel, format!("sip:{}", target));
+
                                     let branch = last_invite_packet.as_ref()
                                         .and_then(|p| parser::parse(p).ok())
                                         .and_then(|p| p.get_header_value(HeaderName::Via).cloned())
                                         .and_then(|v| v.split("branch=").nth(1).map(|s| s.split(';').next().unwrap_or("").to_string()))
-                                        .unwrap_or_else(|| sentiric_sip_core::utils::generate_branch_id());
+                                        // [CLIPPY FIX]: redundant_closure
+                                        .unwrap_or_else(sentiric_sip_core::utils::generate_branch_id);
 
                                     cancel.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={};rport", active_contact_ip, active_contact_port, branch)));
                                     cancel.headers.push(Header::new(HeaderName::From, format!("<sip:mobile@sentiric>;tag={}", current_from_tag)));

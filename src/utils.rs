@@ -9,15 +9,16 @@ pub fn extract_rtp_target(sdp_body: &[u8], default_ip: &str) -> Option<SocketAdd
     let mut port = 0u16;
 
     for line in sdp_str.lines() {
-        if line.starts_with("c=IN IP4 ") {
-            let parsed_ip = line[9..].trim();
+        // [CLIPPY FIX]: manual_strip
+        if let Some(stripped) = line.strip_prefix("c=IN IP4 ") {
+            let parsed_ip = stripped.trim();
             if parsed_ip != "0.0.0.0" {
                 ip = parsed_ip.to_string();
             }
-        } else if line.starts_with("m=audio ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 1 {
-                port = parts[1].parse().unwrap_or(0);
+        } else if let Some(stripped) = line.strip_prefix("m=audio ") {
+            let parts: Vec<&str> = stripped.split_whitespace().collect();
+            if !parts.is_empty() {
+                port = parts[0].parse().unwrap_or(0);
             }
         }
     }

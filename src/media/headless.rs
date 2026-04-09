@@ -14,6 +14,12 @@ impl HeadlessAdapter {
     }
 }
 
+impl Default for HeadlessAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MediaAdapter for HeadlessAdapter {
     fn read_mic(&self, target_8k_samples: usize) -> Vec<i16> {
         if self.is_muted.load(Ordering::Relaxed) {

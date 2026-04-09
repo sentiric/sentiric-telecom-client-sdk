@@ -126,6 +126,7 @@ impl RtpEngine {
 }
 
 // TEMİZ AĞ DÖNGÜSÜ (PURE NETWORK LOOP)
+#[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     is_running: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
@@ -162,7 +163,15 @@ fn run_media_loop(
         };
 
         // 2. NETWORK ENGINE SETUP
-        let codec_type = CodecType::PCMU;
+        // [ARCH-COMPLIANCE FIX]: Hardcoded PCMU kaldırıldı. Çevre değişkeninden veya varsayılan PCMA olarak okur.
+        let pref_codec =
+            std::env::var("PREFERRED_AUDIO_CODEC").unwrap_or_else(|_| "PCMA".to_string());
+        let codec_type = if pref_codec == "PCMU" {
+            CodecType::PCMU
+        } else {
+            CodecType::PCMA
+        };
+
         let mut encoder = CodecFactory::create_encoder(codec_type);
         let mut decoder = CodecFactory::create_decoder(codec_type);
         let mut pacer = Pacer::new(20);
