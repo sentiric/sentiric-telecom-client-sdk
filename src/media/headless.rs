@@ -21,7 +21,8 @@ impl Default for HeadlessAdapter {
 }
 
 impl MediaAdapter for HeadlessAdapter {
-    fn read_mic(&self, target_8k_samples: usize) -> Vec<i16> {
+    fn read_mic(&mut self, target_8k_samples: usize) -> Vec<i16> {
+        // <-- &mut self
         if self.is_muted.load(Ordering::Relaxed) {
             vec![0; target_8k_samples] // Sessizlik
         } else {
@@ -30,8 +31,8 @@ impl MediaAdapter for HeadlessAdapter {
         }
     }
 
-    fn write_spk(&self, _samples_8k: &[i16]) {
-        // Headless modunda ses boşa atılır
+    fn write_spk(&mut self, _samples_8k: &[i16]) { // <-- &mut self
+                                                   // Headless modunda ses boşa atılır
     }
 
     fn is_healthy(&self) -> bool {

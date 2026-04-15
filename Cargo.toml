@@ -1,7 +1,7 @@
 # Dosya: sentiric-telecom-client-sdk/Cargo.toml
 [package]
 name = "sentiric-telecom-client-sdk"
-version = "0.4.13"
+version = "0.4.15"
 edition = "2021"
 authors = ["Sentiric Team <dev@sentiric.ai>"]
 description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"
@@ -10,7 +10,7 @@ description = "Hardened Stateful SIP/RTP Engine with Real-time Media Telemetry"
 crate-type =["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.6.1" }
+sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.6.2" }
 sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.5.6" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"

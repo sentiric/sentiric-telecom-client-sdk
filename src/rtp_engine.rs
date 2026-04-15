@@ -143,7 +143,8 @@ fn run_media_loop(
     // [SELF-HEALING OUTER LOOP]: Adaptör çökerse (Rota Değişirse) buradan yeniden kurulur.
     while is_running.load(Ordering::SeqCst) {
         // 1. ADAPTÖRÜ SEÇ VE BAŞLAT
-        let adapter: Box<dyn MediaAdapter> = if headless {
+        let mut adapter: Box<dyn MediaAdapter> = if headless {
+            // <-- let mut eklendi
             let _ = ui_tx.blocking_send(UacEvent::Log(
                 "👻 Booting Virtual DSP (Headless Mode)".into(),
             ));

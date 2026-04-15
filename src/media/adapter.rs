@@ -1,9 +1,9 @@
 pub trait MediaAdapter: Send + Sync {
     /// Ağdan göndermek üzere mikrofondan belirtilen sayıda PCM örneği okur.
-    fn read_mic(&self, target_8k_samples: usize) -> Vec<i16>;
+    fn read_mic(&mut self, target_8k_samples: usize) -> Vec<i16>;
 
     /// Ağdan alınan PCM örneklerini hoparlöre yazar.
-    fn write_spk(&self, samples_8k: &[i16]);
+    fn write_spk(&mut self, samples_8k: &[i16]);
 
     /// Adaptörün (donanımın) hala ayakta olup olmadığını kontrol eder.
     fn is_healthy(&self) -> bool;
